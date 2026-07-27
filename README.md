@@ -2,6 +2,8 @@
 
 A Home Assistant Lovelace card that renders a **meteogram**: a colour-coded temperature curve layered over stacked precipitation intensity bars. The design is inspired by the charts in the DWD *Warnwetter* app.
 
+![Beautiful Weather Card Meteogram](docs/screenshot-meteogram.png)
+
 Two views share the same hourly forecast:
 
 | View | Range | Purpose |
