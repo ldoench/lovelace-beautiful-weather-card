@@ -6,6 +6,30 @@ export const WeatherEntityFeature = {
   FORECAST_TWICE_DAILY: 4,
 };
 
+// header_extras: up to two small values shown left of the current temperature
+// in the header. Each entry picks exactly one source:
+// - `attribute` from HEADER_EXTRA_FORECAST_ATTRIBUTES comes off the current
+//   hourly forecast entry (only `precipitation_probability` today — the
+//   forecast has no other per-hour attributes worth surfacing here).
+// - `attribute` from HEADER_EXTRA_ENTITY_ATTRIBUTES comes off the weather
+//   entity's own `attributes` object instead.
+// - `entity` is a fully custom entity id (typically a `sensor.*`), read via
+//   its own state.
+// This list is the single source of truth for that split so main.js can look
+// an attribute name up instead of guessing where it lives.
+export const HEADER_EXTRA_FORECAST_ATTRIBUTES = ['precipitation_probability'];
+export const HEADER_EXTRA_ENTITY_ATTRIBUTES = [
+  'humidity',
+  'wind_speed',
+  'pressure',
+  'apparent_temperature',
+];
+export const HEADER_EXTRA_ATTRIBUTES = [
+  ...HEADER_EXTRA_FORECAST_ATTRIBUTES,
+  ...HEADER_EXTRA_ENTITY_ATTRIBUTES,
+];
+export const HEADER_EXTRAS_MAX = 2;
+
 export const DEFAULT_CONFIG = {
   // The week overview is the entry point; a tap on a day in the chart drills
   // down into that day.
@@ -17,6 +41,7 @@ export const DEFAULT_CONFIG = {
   show_detail_row: true,
   show_day_strip: true,
   round_temp: false,
+  header_extras: [{ attribute: 'precipitation_probability' }],
 };
 
 // HA weather conditions -> mdi icon. Uses HA's own icon set, so nothing is bundled.

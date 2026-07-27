@@ -136,6 +136,7 @@ function groupByDay(entries) {
     const temps = [];
     const counts = new Map();
     let precipitationSum = 0;
+    let hasPrecipitation = false;
     let noonEntry = null;
     let noonDiff = Infinity;
 
@@ -146,7 +147,12 @@ function groupByDay(entries) {
       if (typeof entry.templow === 'number' && Number.isFinite(entry.templow)) {
         temps.push(entry.templow);
       }
-      precipitationSum += toNumber(entry.precipitation);
+      if (typeof entry.precipitation === 'number' && Number.isFinite(entry.precipitation)) {
+        // Hourly rate (mm/h) summed over the hour is the millimetres that fell —
+        // see the note on measured precipitation being an intensity, not a total.
+        precipitationSum += entry.precipitation;
+        hasPrecipitation = true;
+      }
 
       if (entry.condition) {
         counts.set(entry.condition, (counts.get(entry.condition) || 0) + 1);
@@ -179,7 +185,9 @@ function groupByDay(entries) {
       min: temps.length ? Math.min(...temps) : null,
       max: temps.length ? Math.max(...temps) : null,
       entries: dayEntries,
-      precipitationSum: round2(precipitationSum),
+      // A day with no valid readings at all gets `null`, not 0 — the two mean
+      // different things for a "–" vs. "0 mm" display in the day strip.
+      precipitationSum: hasPrecipitation ? round2(precipitationSum) : null,
       condition
     };
   });

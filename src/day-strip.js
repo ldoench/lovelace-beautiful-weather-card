@@ -11,6 +11,9 @@ import { conditionColor, conditionIcon } from './const.js';
 export const MIN_TILE_WIDTH = 44;
 const TEMPS_MIN_WIDTH = 34;
 const ICON_MIN_WIDTH = 22;
+// The precipitation row carries a unit ("1,2 mm") and is the first thing to go,
+// so its floor sits above TEMPS_MIN_WIDTH rather than below it.
+const EXTRA_MIN_WIDTH = 40;
 
 // Roughly what the temperature axis, the intensity labels and the card padding
 // take off the card width. Only used to pick the day count, and deliberately a
@@ -37,6 +40,13 @@ function weekdayLabel(date, language) {
     .toLocaleDateString(language, { weekday: 'short' })
     .replace(/\.$/, '')
     .slice(0, 2);
+}
+
+// `null` (no readings at all) and 0 (no rain) both read as "nothing fell" here —
+// the day strip has no room for the distinction, only groupByDay's data does.
+function formatDayPrecipitation(mm, language) {
+  if (mm == null || mm <= 0) return '–';
+  return `${mm.toLocaleString(language, { minimumFractionDigits: 1, maximumFractionDigits: 1 })} mm`;
 }
 
 // How many whole days the strip can show at this card width. The caller caps it
@@ -71,7 +81,11 @@ export function alignDayStrip(strip, { left, right, width } = {}) {
   // has no width, so deciding from the previous state would latch. Writes and
   // reads stay in separate passes to keep it at one reflow.
   tiles.forEach((tile) => {
-    tile.classList.remove('day-strip__tile--tight', 'day-strip__tile--sliver');
+    tile.classList.remove(
+      'day-strip__tile--compact',
+      'day-strip__tile--tight',
+      'day-strip__tile--sliver',
+    );
   });
 
   // Two below-zero temperatures are far wider than two above-zero ones, so the
@@ -83,9 +97,21 @@ export function alignDayStrip(strip, { left, right, width } = {}) {
     return temps ? Math.max(widest, temps.getBoundingClientRect().width) : widest;
   }, 0);
 
+  const neededExtra = tiles.reduce((widest, tile) => {
+    const extra = tile.querySelector('.day-strip__extra');
+    return extra ? Math.max(widest, extra.getBoundingClientRect().width) : widest;
+  }, 0);
+
   tiles.forEach((tile) => {
     const tileWidth = tile.getBoundingClientRect().width;
 
+    // Shrink order: the precipitation row goes first, then min/max, then icon
+    // and label — each stage strictly wider than the next so they never both
+    // trigger out of order.
+    tile.classList.toggle(
+      'day-strip__tile--compact',
+      tileWidth < EXTRA_MIN_WIDTH || tileWidth < neededExtra + 2,
+    );
     tile.classList.toggle(
       'day-strip__tile--tight',
       tileWidth < TEMPS_MIN_WIDTH || tileWidth < needed + 2,
@@ -129,6 +155,7 @@ export function renderDayStrip({ days, activeIndex, language, onSelect } = {}) {
               ${max == null ? nothing : html`<b>${max}°</b>`}
               ${min == null ? nothing : html`<span class="day-strip__min">${min}°</span>`}
             </span>
+            <span class="day-strip__extra">${formatDayPrecipitation(day.precipitationSum, language)}</span>
           </button>
         `;
       })}

@@ -32,17 +32,22 @@ function hourKey(date) {
 
 // The recorder samples irregularly, so values are collapsed onto whole hours.
 // `mean` suits a temperature reading, `last` a sensor that already reports the
-// accumulated amount for its hour.
+// accumulated amount for its hour. Returns the per-hour aggregates plus the
+// sorted raw samples and the last sample's time, which `hourlyValue` below
+// needs to carry a value forward across hours that have no sample of their own.
 function toHourly(samples, aggregate) {
-  const buckets = new Map();
-
+  const parsed = [];
   (samples || []).forEach((sample) => {
     const time = sampleTime(sample);
     const value = sampleValue(sample);
-    if (time === null || value === null) {
-      return;
+    if (time !== null && value !== null) {
+      parsed.push({ time, value });
     }
+  });
+  parsed.sort((a, b) => a.time - b.time);
 
+  const buckets = new Map();
+  parsed.forEach(({ time, value }) => {
     const key = hourKey(time);
     if (!buckets.has(key)) {
       buckets.set(key, []);
@@ -50,18 +55,41 @@ function toHourly(samples, aggregate) {
     buckets.get(key).push(value);
   });
 
-  const result = new Map();
+  const aggregated = new Map();
   buckets.forEach((values, key) => {
     if (aggregate === 'mean') {
-      result.set(key, values.reduce((sum, v) => sum + v, 0) / values.length);
+      aggregated.set(key, values.reduce((sum, v) => sum + v, 0) / values.length);
     } else if (aggregate === 'max') {
-      result.set(key, Math.max(...values));
+      aggregated.set(key, Math.max(...values));
     } else {
-      result.set(key, values[values.length - 1]);
+      aggregated.set(key, values[values.length - 1]);
     }
   });
 
-  return result;
+  return { aggregated, parsed, lastSampleTime: parsed.length ? parsed[parsed.length - 1].time : null };
+}
+
+// The recorder (with `significant_changes_only: false`) still compresses a run
+// of unchanged states into a single sample, so an hour where nothing changed
+// gets none of its own. This carries the last known value forward into that
+// gap. It never reaches past `series.lastSampleTime`: an hour after the last
+// real sample isn't a compression gap, it's simply data we don't have (yet),
+// and must stay `null` rather than be extrapolated as unchanged.
+function hourlyValue(series, hour) {
+  const key = hourKey(hour);
+  if (series.aggregated.has(key)) {
+    return series.aggregated.get(key);
+  }
+  if (series.lastSampleTime === null || hour > series.lastSampleTime) {
+    return null;
+  }
+
+  for (let i = series.parsed.length - 1; i >= 0; i--) {
+    if (series.parsed[i].time < hour) {
+      return series.parsed[i].value;
+    }
+  }
+  return null;
 }
 
 export async function fetchMeasuredHours(hass, historyConfig, start, end) {
@@ -83,6 +111,10 @@ export async function fetchMeasuredHours(hass, historyConfig, start, end) {
       entity_ids: entityIds,
       minimal_response: true,
       no_attributes: true,
+      // Without this HA drops states it considers insignificant, which for a
+      // slowly changing sensor collapses an entire hour to zero samples —
+      // exactly the gap `hourlyValue` is built to fill in.
+      significant_changes_only: false,
     });
   } catch (error) {
     // A missing entity or a recorder without data must not break the card.
@@ -101,9 +133,17 @@ export async function fetchMeasuredHours(hass, historyConfig, start, end) {
   const entries = [];
   for (let hour = new Date(start); hour < end; hour.setHours(hour.getHours() + 1)) {
     const key = hourKey(hour);
-    const temperature = temperatures.has(key) ? Math.round(temperatures.get(key) * 10) / 10 : null;
-    const precip = precipitation.has(key) ? Math.round(precipitation.get(key) * 100) / 100 : null;
-    const probability = probabilities.has(key) ? Math.round(probabilities.get(key)) : null;
+    const rawTemperature = hourlyValue(temperatures, hour);
+    // Carrying the rate forward across a gap only reads correctly if the sensor
+    // truly writes solely on change (confirmed for this integration) — otherwise
+    // a missing sample could just as well mean the rain stopped, not that it
+    // continued at the last known intensity.
+    const rawPrecip = hourlyValue(precipitation, hour);
+    const rawProbability = hourlyValue(probabilities, hour);
+
+    const temperature = rawTemperature === null ? null : Math.round(rawTemperature * 10) / 10;
+    const precip = rawPrecip === null ? null : Math.round(rawPrecip * 100) / 100;
+    const probability = rawProbability === null ? null : Math.round(rawProbability);
 
     if (temperature === null && precip === null && probability === null) {
       continue;
@@ -112,7 +152,9 @@ export async function fetchMeasuredHours(hass, historyConfig, start, end) {
     entries.push({
       datetime: new Date(key).toISOString(),
       temperature,
-      precipitation: precip === null ? 0 : precip,
+      // `null` means "no data", distinct from a measured 0 mm — mergeMeasured
+      // relies on that to fall back to the forecast value instead of blanking it.
+      precipitation: precip,
       precipitation_probability: probability,
       measured: true,
     });
@@ -121,14 +163,34 @@ export async function fetchMeasuredHours(hass, historyConfig, start, end) {
   return entries;
 }
 
-// Measured hours win over forecast hours for the same timestamp.
+// Measured hours win over forecast hours for the same timestamp, but only
+// field by field: an hour with no sample for e.g. precipitation must not blank
+// out a forecast value that's otherwise still the best information available
+// (this matters most for the current, still in-progress hour, where both a
+// partial measurement and a forecast exist side by side).
 export function mergeMeasured(measured, forecasts) {
   if (!measured.length) {
     return forecasts;
   }
 
-  const taken = new Set(measured.map((entry) => Date.parse(entry.datetime)));
-  const future = (forecasts || []).filter((entry) => !taken.has(Date.parse(entry.datetime)));
+  const forecastByTime = new Map((forecasts || []).map((entry) => [Date.parse(entry.datetime), entry]));
+  const measuredTimes = new Set(measured.map((entry) => Date.parse(entry.datetime)));
 
-  return [...measured, ...future].sort((a, b) => Date.parse(a.datetime) - Date.parse(b.datetime));
+  const merged = measured.map((entry) => {
+    const forecastEntry = forecastByTime.get(Date.parse(entry.datetime));
+    return {
+      ...forecastEntry,
+      ...entry,
+      temperature: entry.temperature !== null ? entry.temperature : (forecastEntry ? forecastEntry.temperature : null),
+      precipitation: entry.precipitation !== null ? entry.precipitation : (forecastEntry ? forecastEntry.precipitation : null),
+      precipitation_probability: entry.precipitation_probability !== null
+        ? entry.precipitation_probability
+        : (forecastEntry ? forecastEntry.precipitation_probability : null),
+      measured: true,
+    };
+  });
+
+  const future = (forecasts || []).filter((entry) => !measuredTimes.has(Date.parse(entry.datetime)));
+
+  return [...merged, ...future].sort((a, b) => Date.parse(a.datetime) - Date.parse(b.datetime));
 }

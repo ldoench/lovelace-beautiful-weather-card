@@ -49,14 +49,16 @@ entity: weather.your_station
 | `title` | string | entity name | Card heading |
 | `chart_mode` | string | `trend` | Initial view: `trend` (week overview) or `today` (single day) |
 | `trend_days` | number | `7` | Upper limit for the days the overview covers (max 7; a narrow card shows fewer) |
-| `trend_bucket_hours` | number | `3` | Hours aggregated per bar in the trend view |
+| `trend_bucket_hours` | number | `1` | Hours aggregated per bar in the trend view |
 | `chart_height` | number | `220` | Chart height in pixels |
 | `show_current` | boolean | `true` | Header with the current temperature and condition |
 | `show_detail_row` | boolean | `true` | Read-out row for the selected hour |
 | `show_day_strip` | boolean | `true` | Show day tiles above the chart |
 | `round_temp` | boolean | `false` | Show whole degrees only |
-| `temperature_gradient` | list | see below | Custom temperature colour scale |
-| `precip_bands` | list | see below | Custom precipitation intensity bands |
+| `header_extras` | list | `[{ attribute: precipitation_probability }]` | Up to two small values next to the header temperature |
+| `locale` | string | — (Home Assistant's language) | Force the card's texts to `de` or `en` |
+| `temperature_gradient` | list | see below | Custom temperature colour scale — **YAML only**, no editor widget |
+| `precip_bands` | list | see below | Custom precipitation intensity bands — **YAML only**, no editor widget |
 | `history` | map | — | Sensors supplying recorded values for hours already past |
 
 ### Navigation
@@ -80,6 +82,20 @@ number but cannot raise it above what fits.
 
 Turn it off with `show_day_strip: false`; the overview then labels the weekdays
 on its own axis.
+
+### Header extras
+
+Up to two small values can sit left of the current temperature in the header, each with an optional icon:
+
+```yaml
+header_extras:
+  - attribute: precipitation_probability   # from the current hourly forecast entry
+    icon: mdi:umbrella                     # optional
+  - entity: sensor.aussen_luftfeuchte      # alternative to attribute: a custom entity's state
+    icon: mdi:water-percent
+```
+
+Each entry sets exactly one of `attribute` or `entity`. `attribute` accepts `precipitation_probability` (read off the hourly forecast) or `humidity`, `wind_speed`, `pressure`, `apparent_temperature` (read off the weather entity's own attributes). Default is a single `precipitation_probability` entry; set `header_extras: []` to show none.
 
 ### Measured values for the current day
 

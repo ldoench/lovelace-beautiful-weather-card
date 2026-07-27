@@ -1,5 +1,9 @@
 import { LitElement, html, css, nothing } from 'lit';
-import { DEFAULT_CONFIG } from './const.js';
+import {
+  DEFAULT_CONFIG,
+  HEADER_EXTRA_ATTRIBUTES,
+  HEADER_EXTRAS_MAX,
+} from './const.js';
 
 // Labels for the ha-form schema below. HA editors are conventionally English-only
 // regardless of the dashboard language, matching most third-party cards.
@@ -14,6 +18,17 @@ const LABELS = {
   show_detail_row: 'Show detail row',
   show_day_strip: 'Show day strip',
   round_temp: 'Round temperatures',
+  locale: 'Language',
+};
+
+// Labels for the header-extras attribute picker. Order matches
+// HEADER_EXTRA_ATTRIBUTES (forecast attribute first, then entity attributes).
+const HEADER_EXTRA_ATTRIBUTE_LABELS = {
+  precipitation_probability: 'Precipitation probability (hourly forecast)',
+  humidity: 'Humidity (weather entity attribute)',
+  wind_speed: 'Wind speed (weather entity attribute)',
+  pressure: 'Pressure (weather entity attribute)',
+  apparent_temperature: 'Apparent temperature (weather entity attribute)',
 };
 
 function computeLabel(schema) {
@@ -21,12 +36,14 @@ function computeLabel(schema) {
 }
 
 // Flat, top-level options only. `history.temperature` / `history.precipitation`
-// are handled by two dedicated ha-entity-picker elements below the form (they
-// need a different entity domain filter than `entity`, and nesting them into
-// this schema would require ha-form's object-selector, which has no sensible
-// widget). `temperature_gradient` and `precip_bands` are deliberately left out
-// entirely: both are arrays of nested `{ ... , color }` objects, and there is no
-// usable HA form widget for editing nested lists like that — they stay YAML-only.
+// and `header_extras` are handled by hand-written fields below the form (see
+// render()) — the first needs a different entity domain filter than `entity`,
+// the second is a small array of `{ attribute | entity, icon }` objects, and
+// nesting either into this schema would require ha-form's object-selector,
+// which has no sensible widget. `temperature_gradient` and `precip_bands` are
+// deliberately left out entirely: both are arrays of nested `{ ... , color }`
+// objects, and there is no usable HA form widget for editing nested lists
+// like that — they stay YAML-only.
 const SCHEMA = [
   { name: 'entity', required: true, selector: { entity: { domain: 'weather' } } },
   { name: 'title', selector: { text: {} } },
@@ -51,6 +68,19 @@ const SCHEMA = [
   { name: 'show_detail_row', selector: { boolean: {} } },
   { name: 'show_day_strip', selector: { boolean: {} } },
   { name: 'round_temp', selector: { boolean: {} } },
+  {
+    name: 'locale',
+    selector: {
+      select: {
+        mode: 'dropdown',
+        options: [
+          { value: '', label: "Home Assistant's language (default)" },
+          { value: 'de', label: 'Deutsch' },
+          { value: 'en', label: 'English' },
+        ],
+      },
+    },
+  },
 ];
 
 class BeautifulWeatherCardEditor extends LitElement {
@@ -69,7 +99,8 @@ class BeautifulWeatherCardEditor extends LitElement {
         gap: 16px;
       }
 
-      .history-fields {
+      .history-fields,
+      .header-extras-fields {
         display: flex;
         flex-direction: column;
         gap: 16px;
@@ -79,6 +110,19 @@ class BeautifulWeatherCardEditor extends LitElement {
         font-size: 12px;
         color: var(--secondary-text-color);
         margin: -8px 0 0;
+      }
+
+      .header-extra-slot {
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+        padding: 8px 0;
+        border-top: 1px solid var(--divider-color);
+      }
+
+      .header-extra-slot:first-of-type {
+        border-top: none;
+        padding-top: 0;
       }
     `;
   }
@@ -119,6 +163,72 @@ class BeautifulWeatherCardEditor extends LitElement {
     this._fireConfigChanged();
   }
 
+  // header_extras as currently configured, falling back to the default so a
+  // freshly-added card shows its one default slot instead of two empty ones.
+  get _headerExtras() {
+    return this._config.header_extras || DEFAULT_CONFIG.header_extras;
+  }
+
+  _headerExtraSourceChanged(index, ev) {
+    ev.stopPropagation();
+    const value = ev.detail.value;
+    const current = this._headerExtras[index] || {};
+
+    if (!value) {
+      this._setHeaderExtra(index, null);
+    } else if (value === '__entity__') {
+      this._setHeaderExtra(index, { entity: current.entity || '', ...(current.icon ? { icon: current.icon } : {}) });
+    } else {
+      this._setHeaderExtra(index, { attribute: value, ...(current.icon ? { icon: current.icon } : {}) });
+    }
+  }
+
+  _headerExtraEntityChanged(index, ev) {
+    ev.stopPropagation();
+    const current = this._headerExtras[index] || {};
+    this._setHeaderExtra(index, {
+      entity: ev.detail.value || '',
+      ...(current.icon ? { icon: current.icon } : {}),
+    });
+  }
+
+  _headerExtraIconChanged(index, ev) {
+    ev.stopPropagation();
+    const current = this._headerExtras[index] || {};
+    if (!current.attribute && !current.entity) {
+      return;
+    }
+    const next = { ...current };
+    if (ev.detail.value) {
+      next.icon = ev.detail.value;
+    } else {
+      delete next.icon;
+    }
+    this._setHeaderExtra(index, next);
+  }
+
+  // Writes one slot back into the array, drops trailing empty slots, and
+  // removes the config key entirely once nothing is left.
+  _setHeaderExtra(index, value) {
+    const extras = [...this._headerExtras];
+    extras[index] = value;
+
+    while (extras.length && !extras[extras.length - 1]) {
+      extras.pop();
+    }
+    const cleaned = extras.filter(Boolean).slice(0, HEADER_EXTRAS_MAX);
+
+    const config = { ...this._config };
+    if (cleaned.length) {
+      config.header_extras = cleaned;
+    } else {
+      delete config.header_extras;
+    }
+
+    this._config = config;
+    this._fireConfigChanged();
+  }
+
   _updateConfig(value) {
     this._config = { ...this._config, ...value };
     this._fireConfigChanged();
@@ -131,6 +241,62 @@ class BeautifulWeatherCardEditor extends LitElement {
       composed: true,
     });
     this.dispatchEvent(event);
+  }
+
+  // One slot renders as a source picker (attribute or custom entity), plus an
+  // entity picker and/or icon picker once a source is chosen.
+  _renderHeaderExtraSlot(index) {
+    const extra = this._headerExtras[index] || {};
+    const sourceValue = extra.entity !== undefined ? '__entity__' : (extra.attribute || '');
+
+    return html`
+      <div class="header-extra-slot">
+        <ha-selector
+          .hass=${this.hass}
+          .selector=${{
+            select: {
+              mode: 'dropdown',
+              options: [
+                { value: '', label: `Extra value ${index + 1}: none` },
+                ...HEADER_EXTRA_ATTRIBUTES.map((attribute) => ({
+                  value: attribute,
+                  label: HEADER_EXTRA_ATTRIBUTE_LABELS[attribute],
+                })),
+                { value: '__entity__', label: 'Custom sensor entity…' },
+              ],
+            },
+          }}
+          .value=${sourceValue}
+          .label=${`Extra value ${index + 1}`}
+          @value-changed=${(ev) => this._headerExtraSourceChanged(index, ev)}
+        ></ha-selector>
+
+        ${sourceValue === '__entity__'
+          ? html`
+              <ha-entity-picker
+                .hass=${this.hass}
+                .value=${extra.entity || ''}
+                .label=${'Sensor entity'}
+                .includeDomains=${['sensor']}
+                allow-custom-entity
+                @value-changed=${(ev) => this._headerExtraEntityChanged(index, ev)}
+              ></ha-entity-picker>
+            `
+          : nothing}
+
+        ${sourceValue
+          ? html`
+              <ha-selector
+                .hass=${this.hass}
+                .selector=${{ icon: {} }}
+                .value=${extra.icon || ''}
+                .label=${'Icon (optional)'}
+                @value-changed=${(ev) => this._headerExtraIconChanged(index, ev)}
+              ></ha-selector>
+            `
+          : nothing}
+      </div>
+    `;
   }
 
   render() {
@@ -148,6 +314,13 @@ class BeautifulWeatherCardEditor extends LitElement {
         .computeLabel=${computeLabel}
         @value-changed=${this._formChanged}
       ></ha-form>
+
+      <div class="header-extras-fields">
+        <p class="history-hint">
+          Up to two small values next to the current temperature in the header.
+        </p>
+        ${[0, 1].map((index) => this._renderHeaderExtraSlot(index))}
+      </div>
 
       <div class="history-fields">
         <p class="history-hint">

@@ -14961,6 +14961,30 @@ const CARD_VERSION = '0.1.0';
 const WeatherEntityFeature = {
   FORECAST_HOURLY: 2};
 
+// header_extras: up to two small values shown left of the current temperature
+// in the header. Each entry picks exactly one source:
+// - `attribute` from HEADER_EXTRA_FORECAST_ATTRIBUTES comes off the current
+//   hourly forecast entry (only `precipitation_probability` today — the
+//   forecast has no other per-hour attributes worth surfacing here).
+// - `attribute` from HEADER_EXTRA_ENTITY_ATTRIBUTES comes off the weather
+//   entity's own `attributes` object instead.
+// - `entity` is a fully custom entity id (typically a `sensor.*`), read via
+//   its own state.
+// This list is the single source of truth for that split so main.js can look
+// an attribute name up instead of guessing where it lives.
+const HEADER_EXTRA_FORECAST_ATTRIBUTES = ['precipitation_probability'];
+const HEADER_EXTRA_ENTITY_ATTRIBUTES = [
+  'humidity',
+  'wind_speed',
+  'pressure',
+  'apparent_temperature',
+];
+const HEADER_EXTRA_ATTRIBUTES = [
+  ...HEADER_EXTRA_FORECAST_ATTRIBUTES,
+  ...HEADER_EXTRA_ENTITY_ATTRIBUTES,
+];
+const HEADER_EXTRAS_MAX = 2;
+
 const DEFAULT_CONFIG = {
   // The week overview is the entry point; a tap on a day in the chart drills
   // down into that day.
@@ -14972,6 +14996,7 @@ const DEFAULT_CONFIG = {
   show_detail_row: true,
   show_day_strip: true,
   round_temp: false,
+  header_extras: [{ attribute: 'precipitation_probability' }],
 };
 
 // HA weather conditions -> mdi icon. Uses HA's own icon set, so nothing is bundled.
@@ -15271,6 +15296,7 @@ function groupByDay(entries) {
     const temps = [];
     const counts = new Map();
     let precipitationSum = 0;
+    let hasPrecipitation = false;
     let noonEntry = null;
     let noonDiff = Infinity;
 
@@ -15281,7 +15307,12 @@ function groupByDay(entries) {
       if (typeof entry.templow === 'number' && Number.isFinite(entry.templow)) {
         temps.push(entry.templow);
       }
-      precipitationSum += toNumber(entry.precipitation);
+      if (typeof entry.precipitation === 'number' && Number.isFinite(entry.precipitation)) {
+        // Hourly rate (mm/h) summed over the hour is the millimetres that fell —
+        // see the note on measured precipitation being an intensity, not a total.
+        precipitationSum += entry.precipitation;
+        hasPrecipitation = true;
+      }
 
       if (entry.condition) {
         counts.set(entry.condition, (counts.get(entry.condition) || 0) + 1);
@@ -15314,7 +15345,9 @@ function groupByDay(entries) {
       min: temps.length ? Math.min(...temps) : null,
       max: temps.length ? Math.max(...temps) : null,
       entries: dayEntries,
-      precipitationSum: round2(precipitationSum),
+      // A day with no valid readings at all gets `null`, not 0 — the two mean
+      // different things for a "–" vs. "0 mm" display in the day strip.
+      precipitationSum: hasPrecipitation ? round2(precipitationSum) : null,
       condition
     };
   });
@@ -15659,6 +15692,9 @@ function crosshairPlugin(getIndex, lineColor) {
 // the day strip above can be padded to the same edges. `afterLayout` rather than
 // `afterRender`: it fires before the first paint and on every resize, and the
 // callback only touches DOM outside the chart, so there is nothing to loop back.
+// Reports the full chartArea rect (left/right/top/bottom) plus the chart's own
+// width/height, so a swipe overlay can be sized against the plot area exactly —
+// left/right/width keep their existing meaning for callers that only used those.
 function layoutReportPlugin(onLayout) {
   return {
     id: 'meteogramLayout',
@@ -15667,7 +15703,65 @@ function layoutReportPlugin(onLayout) {
       if (!area) {
         return;
       }
-      onLayout({ left: area.left, right: area.right, width: chart.width });
+      onLayout({
+        left: area.left,
+        right: area.right,
+        top: area.top,
+        bottom: area.bottom,
+        width: chart.width,
+        height: chart.height,
+      });
+    },
+  };
+}
+
+// Calendar-day boundaries over the flat entries array, grouped in order of first
+// appearance — the same order `sliceForecast`'s `day_offset` counts in (0 =
+// today). Kept local to chart.js instead of reusing data.js's `groupByDay`
+// because only index ranges are needed here, not the aggregates that helper
+// also computes.
+function dayBoundaries(entries) {
+  const days = [];
+  let lastKey = null;
+
+  entries.forEach((entry, index) => {
+    const date = new Date(entry.datetime);
+    const key = date.getFullYear() + '-' + date.getMonth() + '-' + date.getDate();
+    if (key !== lastKey) {
+      days.push({ startIndex: index, endIndex: index });
+      lastKey = key;
+    } else {
+      days[days.length - 1].endIndex = index;
+    }
+  });
+
+  return days;
+}
+
+// Compact mode's overview band shows which day is currently open in the day view
+// above it — a low-opacity fill over that day's x-range, drawn before the
+// datasets so the curve and bars stay on top.
+function activeDayPlugin(entries, activeDay, fillColor) {
+  return {
+    id: 'meteogramActiveDay',
+    beforeDatasetsDraw(chart) {
+      const day = dayBoundaries(entries)[activeDay];
+      if (!day) {
+        return;
+      }
+
+      const meta = chart.getDatasetMeta(0);
+      const startPoint = meta && meta.data && meta.data[day.startIndex];
+      const endPoint = meta && meta.data && meta.data[day.endIndex];
+      if (!startPoint || !endPoint) {
+        return;
+      }
+
+      const { ctx, chartArea } = chart;
+      ctx.save();
+      ctx.fillStyle = fillColor;
+      ctx.fillRect(startPoint.x, chartArea.top, endPoint.x - startPoint.x, chartArea.bottom - chartArea.top);
+      ctx.restore();
     },
   };
 }
@@ -15703,8 +15797,10 @@ function xTickCallback(entries, mode, language) {
 // says "this part already happened", the line is a plain hairline, and a single
 // small "Jetzt" names the line instead of labelling both regions. Drawn before
 // the datasets, so nothing of it can ever sit on top of the curve.
-// Does nothing when no measured values are configured.
-function nowDividerPlugin(entries, localize, lineColor, shadeColor) {
+// Does nothing when no measured values are configured. `showLabel` drops just the
+// "now" text for the compact overview band, which keeps the hairline but has no
+// room for a caption.
+function nowDividerPlugin(entries, localize, lineColor, showLabel = true) {
   return {
     id: 'meteogramNowDivider',
     beforeDatasetsDraw(chart) {
@@ -15722,17 +15818,17 @@ function nowDividerPlugin(entries, localize, lineColor, shadeColor) {
       const { ctx, chartArea } = chart;
       ctx.save();
 
-      ctx.globalAlpha = 0.4;
-      ctx.fillStyle = shadeColor;
-      ctx.fillRect(chartArea.left, chartArea.top, point.x - chartArea.left, chartArea.bottom - chartArea.top);
-
-      ctx.globalAlpha = 0.6;
       ctx.beginPath();
       ctx.moveTo(point.x, chartArea.top);
       ctx.lineTo(point.x, chartArea.bottom);
       ctx.lineWidth = 1;
       ctx.strokeStyle = lineColor;
       ctx.stroke();
+
+      if (!showLabel) {
+        ctx.restore();
+        return;
+      }
 
       ctx.font = '10px system-ui, sans-serif';
       ctx.fillStyle = lineColor;
@@ -15751,6 +15847,7 @@ function nowDividerPlugin(entries, localize, lineColor, shadeColor) {
 
 function buildMeteogramChartConfig({
   data, mode, cardConfig, language, localize, onSelect, onLayout, onHover, getActiveIndex,
+  animate = true, compact = false, activeDay = null,
 }) {
   const entries = data.entries;
   const bands = cardConfig.precip_bands || DEFAULT_PRECIP_BANDS;
@@ -15781,10 +15878,27 @@ function buildMeteogramChartConfig({
       data: temperatures,
       yAxisID: 'temp',
       order: 0,
-      borderWidth: 2.5,
+      borderWidth: compact ? 1.5 : 2.5,
+      segment: {
+        borderWidth: (ctx) => {
+          if (compact) {
+            return 1.5;
+          }
+          const p0 = entries[ctx.p0DataIndex];
+          const p1 = entries[ctx.p1DataIndex];
+          return (p0 && p1 && p0.measured && p1.measured) ? 1.5 : 2.5;
+        },
+      },
       tension: 0.35,
       pointRadius: 0,
       pointHitRadius: 12,
+      // The hover dot Chart.js normally draws on the active point reads as a
+      // stray mark rather than a highlight — suppressed everywhere, not just in
+      // compact mode. `pointHitRadius` stays untouched: the card's detail row
+      // still needs hover to work.
+      pointHoverRadius: 0,
+      hoverRadius: 0,
+      pointHoverBorderWidth: 0,
       fill: false,
       borderColor: (context) => {
         const { ctx, chartArea, scales } = context.chart;
@@ -15813,14 +15927,20 @@ function buildMeteogramChartConfig({
     type: 'bar',
     data: { labels, datasets },
     plugins: [
-      nowDividerPlugin(entries, localize, secondaryColor, gridColor),
+      nowDividerPlugin(entries, localize, secondaryColor, !compact),
       crosshairPlugin(() => (getActiveIndex ? getActiveIndex() : null), secondaryColor),
+      ...(activeDay != null ? [activeDayPlugin(entries, activeDay, gridColor)] : []),
       ...(onLayout ? [layoutReportPlugin(onLayout)] : []),
     ],
     options: {
       responsive: true,
       maintainAspectRatio: false,
-      animation: { duration: 250 },
+      // Off for chart rebuilds triggered by day/mode navigation — main.js already
+      // plays its own slide/zoom transition on the surrounding element for that
+      // case, and Chart.js's own entrance animation (drawing up from the axis) is
+      // exactly the "jumps in from below" the card used to be criticized for. A
+      // plain data refresh (new forecast, same mode/day) still gets the fade.
+      animation: animate ? { duration: 250 } : false,
       interaction: { mode: 'index', intersect: false },
       // `intersect: false` means a tap anywhere in the plot area counts, not just
       // on the curve. In the trend view the card turns that index into a day and
@@ -15842,7 +15962,9 @@ function buildMeteogramChartConfig({
         x: {
           stacked: true,
           grid: {
-            display: mode === 'trend',
+            // Compact's overview band keeps the day dividers regardless of mode —
+            // they are the only structure left once ticks/labels are gone.
+            display: compact || mode === 'trend',
             drawTicks: false,
             color: (context) => {
               const entry = entries[context.index];
@@ -15854,7 +15976,7 @@ function buildMeteogramChartConfig({
             },
           },
           border: { display: false },
-          ticks: {
+          ticks: compact ? { display: false } : {
             color: secondaryColor,
             maxRotation: 0,
             autoSkip: false,
@@ -15864,16 +15986,18 @@ function buildMeteogramChartConfig({
         },
         temp: {
           position: 'left',
-          // Horizontal guides are what make the curve readable at a glance.
+          // Horizontal guides are what make the curve readable at a glance — but
+          // compact's whole point is to show nothing except the curve itself and
+          // the day dividers, so they go along with the ticks there.
           grid: {
-            display: true,
+            display: !compact,
             drawTicks: false,
             color: gridColor,
           },
           border: { display: false, dash: [2, 3] },
           min: tempRange.min,
           max: tempRange.max,
-          ticks: {
+          ticks: compact ? { display: false } : {
             color: secondaryColor,
             font: { size: 11 },
             stepSize: TEMP_AXIS_STEP,
@@ -15882,7 +16006,9 @@ function buildMeteogramChartConfig({
         },
         precip: {
           position: 'right',
-          display: mode !== 'trend',
+          // Already hidden in trend mode; compact hides it in day mode too, since
+          // the overview band never shows band labels.
+          display: compact ? false : mode !== 'trend',
           stacked: true,
           min: 0,
           max: precipMax,
@@ -15891,7 +16017,7 @@ function buildMeteogramChartConfig({
           afterBuildTicks: (axis) => {
             axis.ticks = visibleBandTicks.map((tick) => ({ value: tick.value }));
           },
-          ticks: {
+          ticks: compact ? { display: false } : {
             color: secondaryColor,
             font: { size: 10 },
             autoSkip: false,
@@ -15905,7 +16031,7 @@ function buildMeteogramChartConfig({
       plugins: {
         legend: { display: false },
         tooltip: {
-          enabled: mode === 'trend',
+          enabled: compact ? false : mode === 'trend',
           displayColors: false,
           // `interaction.mode: 'index'` yields one item per dataset — one line plus
           // one per precipitation band. Everything the tooltip shows belongs to the
@@ -15947,7 +16073,9 @@ function buildMeteogramChartConfig({
           },
         },
       },
-      layout: { padding: { top: 4, bottom: 0 } },
+      // Compact's band is roughly a fifth of the normal height, so even the
+      // small default padding would eat into it noticeably.
+      layout: { padding: compact ? { top: 1, bottom: 1 } : { top: 4, bottom: 0 } },
       color: textColor,
     },
   };
@@ -15987,17 +16115,22 @@ function hourKey(date) {
 
 // The recorder samples irregularly, so values are collapsed onto whole hours.
 // `mean` suits a temperature reading, `last` a sensor that already reports the
-// accumulated amount for its hour.
+// accumulated amount for its hour. Returns the per-hour aggregates plus the
+// sorted raw samples and the last sample's time, which `hourlyValue` below
+// needs to carry a value forward across hours that have no sample of their own.
 function toHourly(samples, aggregate) {
-  const buckets = new Map();
-
+  const parsed = [];
   (samples || []).forEach((sample) => {
     const time = sampleTime(sample);
     const value = sampleValue(sample);
-    if (time === null || value === null) {
-      return;
+    if (time !== null && value !== null) {
+      parsed.push({ time, value });
     }
+  });
+  parsed.sort((a, b) => a.time - b.time);
 
+  const buckets = new Map();
+  parsed.forEach(({ time, value }) => {
     const key = hourKey(time);
     if (!buckets.has(key)) {
       buckets.set(key, []);
@@ -16005,14 +16138,37 @@ function toHourly(samples, aggregate) {
     buckets.get(key).push(value);
   });
 
-  const result = new Map();
+  const aggregated = new Map();
   buckets.forEach((values, key) => {
     {
-      result.set(key, values.reduce((sum, v) => sum + v, 0) / values.length);
+      aggregated.set(key, values.reduce((sum, v) => sum + v, 0) / values.length);
     }
   });
 
-  return result;
+  return { aggregated, parsed, lastSampleTime: parsed.length ? parsed[parsed.length - 1].time : null };
+}
+
+// The recorder (with `significant_changes_only: false`) still compresses a run
+// of unchanged states into a single sample, so an hour where nothing changed
+// gets none of its own. This carries the last known value forward into that
+// gap. It never reaches past `series.lastSampleTime`: an hour after the last
+// real sample isn't a compression gap, it's simply data we don't have (yet),
+// and must stay `null` rather than be extrapolated as unchanged.
+function hourlyValue(series, hour) {
+  const key = hourKey(hour);
+  if (series.aggregated.has(key)) {
+    return series.aggregated.get(key);
+  }
+  if (series.lastSampleTime === null || hour > series.lastSampleTime) {
+    return null;
+  }
+
+  for (let i = series.parsed.length - 1; i >= 0; i--) {
+    if (series.parsed[i].time < hour) {
+      return series.parsed[i].value;
+    }
+  }
+  return null;
 }
 
 async function fetchMeasuredHours(hass, historyConfig, start, end) {
@@ -16034,6 +16190,10 @@ async function fetchMeasuredHours(hass, historyConfig, start, end) {
       entity_ids: entityIds,
       minimal_response: true,
       no_attributes: true,
+      // Without this HA drops states it considers insignificant, which for a
+      // slowly changing sensor collapses an entire hour to zero samples —
+      // exactly the gap `hourlyValue` is built to fill in.
+      significant_changes_only: false,
     });
   } catch (error) {
     // A missing entity or a recorder without data must not break the card.
@@ -16052,9 +16212,17 @@ async function fetchMeasuredHours(hass, historyConfig, start, end) {
   const entries = [];
   for (let hour = new Date(start); hour < end; hour.setHours(hour.getHours() + 1)) {
     const key = hourKey(hour);
-    const temperature = temperatures.has(key) ? Math.round(temperatures.get(key) * 10) / 10 : null;
-    const precip = precipitation.has(key) ? Math.round(precipitation.get(key) * 100) / 100 : null;
-    const probability = probabilities.has(key) ? Math.round(probabilities.get(key)) : null;
+    const rawTemperature = hourlyValue(temperatures, hour);
+    // Carrying the rate forward across a gap only reads correctly if the sensor
+    // truly writes solely on change (confirmed for this integration) — otherwise
+    // a missing sample could just as well mean the rain stopped, not that it
+    // continued at the last known intensity.
+    const rawPrecip = hourlyValue(precipitation, hour);
+    const rawProbability = hourlyValue(probabilities, hour);
+
+    const temperature = rawTemperature === null ? null : Math.round(rawTemperature * 10) / 10;
+    const precip = rawPrecip === null ? null : Math.round(rawPrecip * 100) / 100;
+    const probability = rawProbability === null ? null : Math.round(rawProbability);
 
     if (temperature === null && precip === null && probability === null) {
       continue;
@@ -16063,7 +16231,9 @@ async function fetchMeasuredHours(hass, historyConfig, start, end) {
     entries.push({
       datetime: new Date(key).toISOString(),
       temperature,
-      precipitation: precip === null ? 0 : precip,
+      // `null` means "no data", distinct from a measured 0 mm — mergeMeasured
+      // relies on that to fall back to the forecast value instead of blanking it.
+      precipitation: precip,
       precipitation_probability: probability,
       measured: true,
     });
@@ -16072,16 +16242,36 @@ async function fetchMeasuredHours(hass, historyConfig, start, end) {
   return entries;
 }
 
-// Measured hours win over forecast hours for the same timestamp.
+// Measured hours win over forecast hours for the same timestamp, but only
+// field by field: an hour with no sample for e.g. precipitation must not blank
+// out a forecast value that's otherwise still the best information available
+// (this matters most for the current, still in-progress hour, where both a
+// partial measurement and a forecast exist side by side).
 function mergeMeasured(measured, forecasts) {
   if (!measured.length) {
     return forecasts;
   }
 
-  const taken = new Set(measured.map((entry) => Date.parse(entry.datetime)));
-  const future = (forecasts || []).filter((entry) => !taken.has(Date.parse(entry.datetime)));
+  const forecastByTime = new Map((forecasts || []).map((entry) => [Date.parse(entry.datetime), entry]));
+  const measuredTimes = new Set(measured.map((entry) => Date.parse(entry.datetime)));
 
-  return [...measured, ...future].sort((a, b) => Date.parse(a.datetime) - Date.parse(b.datetime));
+  const merged = measured.map((entry) => {
+    const forecastEntry = forecastByTime.get(Date.parse(entry.datetime));
+    return {
+      ...forecastEntry,
+      ...entry,
+      temperature: entry.temperature !== null ? entry.temperature : (forecastEntry ? forecastEntry.temperature : null),
+      precipitation: entry.precipitation !== null ? entry.precipitation : (forecastEntry ? forecastEntry.precipitation : null),
+      precipitation_probability: entry.precipitation_probability !== null
+        ? entry.precipitation_probability
+        : (forecastEntry ? forecastEntry.precipitation_probability : null),
+      measured: true,
+    };
+  });
+
+  const future = (forecasts || []).filter((entry) => !measuredTimes.has(Date.parse(entry.datetime)));
+
+  return [...merged, ...future].sort((a, b) => Date.parse(a.datetime) - Date.parse(b.datetime));
 }
 
 // Day strip: the row of day tiles above the chart, after the DWD-Warnwetter app.
@@ -16095,6 +16285,9 @@ function mergeMeasured(measured, forecasts) {
 const MIN_TILE_WIDTH = 44;
 const TEMPS_MIN_WIDTH = 34;
 const ICON_MIN_WIDTH = 22;
+// The precipitation row carries a unit ("1,2 mm") and is the first thing to go,
+// so its floor sits above TEMPS_MIN_WIDTH rather than below it.
+const EXTRA_MIN_WIDTH = 40;
 
 // Roughly what the temperature axis, the intensity labels and the card padding
 // take off the card width. Only used to pick the day count, and deliberately a
@@ -16121,6 +16314,13 @@ function weekdayLabel(date, language) {
     .toLocaleDateString(language, { weekday: 'short' })
     .replace(/\.$/, '')
     .slice(0, 2);
+}
+
+// `null` (no readings at all) and 0 (no rain) both read as "nothing fell" here —
+// the day strip has no room for the distinction, only groupByDay's data does.
+function formatDayPrecipitation(mm, language) {
+  if (mm == null || mm <= 0) return '–';
+  return `${mm.toLocaleString(language, { minimumFractionDigits: 1, maximumFractionDigits: 1 })} mm`;
 }
 
 // How many whole days the strip can show at this card width. The caller caps it
@@ -16155,7 +16355,11 @@ function alignDayStrip(strip, { left, right, width } = {}) {
   // has no width, so deciding from the previous state would latch. Writes and
   // reads stay in separate passes to keep it at one reflow.
   tiles.forEach((tile) => {
-    tile.classList.remove('day-strip__tile--tight', 'day-strip__tile--sliver');
+    tile.classList.remove(
+      'day-strip__tile--compact',
+      'day-strip__tile--tight',
+      'day-strip__tile--sliver',
+    );
   });
 
   // Two below-zero temperatures are far wider than two above-zero ones, so the
@@ -16167,9 +16371,21 @@ function alignDayStrip(strip, { left, right, width } = {}) {
     return temps ? Math.max(widest, temps.getBoundingClientRect().width) : widest;
   }, 0);
 
+  const neededExtra = tiles.reduce((widest, tile) => {
+    const extra = tile.querySelector('.day-strip__extra');
+    return extra ? Math.max(widest, extra.getBoundingClientRect().width) : widest;
+  }, 0);
+
   tiles.forEach((tile) => {
     const tileWidth = tile.getBoundingClientRect().width;
 
+    // Shrink order: the precipitation row goes first, then min/max, then icon
+    // and label — each stage strictly wider than the next so they never both
+    // trigger out of order.
+    tile.classList.toggle(
+      'day-strip__tile--compact',
+      tileWidth < EXTRA_MIN_WIDTH || tileWidth < neededExtra + 2,
+    );
     tile.classList.toggle(
       'day-strip__tile--tight',
       tileWidth < TEMPS_MIN_WIDTH || tileWidth < needed + 2,
@@ -16213,6 +16429,7 @@ function renderDayStrip({ days, activeIndex, language, onSelect } = {}) {
               ${max == null ? A : x`<b>${max}°</b>`}
               ${min == null ? A : x`<span class="day-strip__min">${min}°</span>`}
             </span>
+            <span class="day-strip__extra">${formatDayPrecipitation(day.precipitationSum, language)}</span>
           </button>
         `;
       })}
@@ -16278,6 +16495,26 @@ const cardStyles = i$1`
     font-weight: 200;
     line-height: 1;
     letter-spacing: -0.01em;
+    flex: 0 0 auto;
+  }
+
+  /* header_extras: up to two small values left of the temperature, in
+     configuration order (see HEADER_EXTRAS_MAX / _renderHeader in main.js). A
+     slot with no value right now is left out of the DOM entirely rather than
+     rendered empty — the header's height already comes from the icon and
+     temperature next to these, so nothing here needs to reserve space. */
+  .header .header__extra {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    color: var(--secondary-text-color);
+    font-size: 12px;
+    white-space: nowrap;
+  }
+
+  .header .header__extra-icon {
+    --mdc-icon-size: 16px;
     flex: 0 0 auto;
   }
 
@@ -16379,9 +16616,23 @@ const cardStyles = i$1`
     color: var(--secondary-text-color);
   }
 
+  /* Second, smaller line below min/max: daily precipitation total (sunshine
+     hours would join it here if the forecast ever carries that field — see
+     computeMeteogramData in meteogram/data.js). */
+  .day-strip__extra {
+    font-size: 10px;
+    color: var(--secondary-text-color);
+    white-space: nowrap;
+  }
+
   /* A part-day at the start of the overview owns only a sliver of the chart.
      Its tile keeps that width and drops what no longer fits, instead of
-     clipping glyphs in half. */
+     clipping glyphs in half. Shrink order: the precipitation row first, then
+     min/max, then icon and label. */
+  .day-strip__tile--compact .day-strip__extra {
+    display: none;
+  }
+
   .day-strip__tile--tight .day-strip__temps {
     display: none;
   }
@@ -16391,102 +16642,184 @@ const cardStyles = i$1`
     display: none;
   }
 
-  /* Value bar between strip and chart: hairline-boxed single line, grey labels,
-     values in text colour. Fixed height keeps the chart from jumping when the
-     selected hour has fewer values. */
+  /* Value row between strip and chart: a fixed-column grid instead of the
+     previous wrapping flex row. Every slot is always present (a missing value
+     renders as "–", never as nothing), and the grid tracks are sized by
+     minmax(0, 1fr) or a fixed width rather than by their content, so neither a
+     one-digit/three-digit value nor "Jetzt" vs. a five-character time ever
+     changes a column's width. Combined with a fixed height (not a
+     min-height), that is what keeps the row from jumping or rewrapping on
+     every hover — including the day-nav arrows now living at its outer edges,
+     which flip between enabled and disabled without moving anything next to
+     them. Icons replace spelled-out labels so the row never wraps on narrow
+     cards. */
   .detail {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: baseline;
-    gap: 0 14px;
-    min-height: 22px;
-    padding: 4px 0 5px;
+    display: grid;
+    grid-template-columns: 24px 7.5em repeat(4, minmax(0, 1fr)) 24px;
+    align-items: center;
+    column-gap: 8px;
+    height: 26px;
+    padding: 0;
     margin-bottom: 4px;
     border-top: 1px solid var(--divider-color);
     border-bottom: 1px solid var(--divider-color);
-    font-size: 11px;
-    line-height: 1.4;
-    color: var(--secondary-text-color);
+    font-variant-numeric: tabular-nums;
+    overflow: hidden;
   }
 
-  .detail .time {
+  /* Day-nav's back/forward arrows, now flanking the detail row instead of
+     sitting in a row of their own below the chart. */
+  .detail__nav {
+    appearance: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--primary-text-color);
+    cursor: pointer;
+  }
+
+  .detail__nav ha-icon {
+    --mdc-icon-size: 18px;
+  }
+
+  .detail__nav:disabled {
+    color: var(--secondary-text-color);
+    opacity: 0.45;
+    cursor: default;
+  }
+
+  .detail__nav:focus-visible {
+    outline: 2px solid var(--primary-color);
+    outline-offset: -1px;
+  }
+
+  /* Weekday + date of the day currently shown, with the hovered hour's time
+     (or "Jetzt") beside it — a quiet spot for that read-out now that it no
+     longer heads the row on its own. */
+  .detail__date {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .detail__weekday {
     font-size: 13px;
     font-weight: 500;
     color: var(--primary-text-color);
-    min-width: 3.2em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
-  .detail .item {
-    display: inline-flex;
-    align-items: baseline;
-    gap: 4px;
+  .detail__time {
+    font-size: 11px;
+    color: var(--secondary-text-color);
     white-space: nowrap;
   }
 
-  .detail .item b {
+  .detail__item {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+  }
+
+  .detail__icon {
+    --mdc-icon-size: 16px;
+    color: var(--secondary-text-color);
+    flex: 0 0 auto;
+  }
+
+  .detail__value {
     font-size: 13px;
-    font-weight: 400;
     color: var(--primary-text-color);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .chart-wrap {
     position: relative;
     width: 100%;
+    /* Clips the sliding/zooming .chart-anim content below so a transition
+       never grows the card or is visible outside the chart area. */
+    overflow: hidden;
   }
 
   .chart-wrap--clickable {
     cursor: pointer;
   }
 
-  /* Sits below the chart now, not above it: top margin is the breathing room
-     against the plot, and there is deliberately no bottom margin — ha-card's
-     own 6px bottom padding is what keeps this flush with the card edge. */
-  .day-nav {
+  /* Wraps the canvas so a mode switch (see _fadeSwitch in main.js) can
+     crossfade this layer alone: chart-wrap keeps its own fixed height
+     throughout, so neither the card nor the day strip above it ever moves.
+     The class is toggled imperatively from main.js rather than bound in the
+     Lit template, so it survives the re-render that swaps the chart
+     underneath. Day-to-day navigation no longer touches this element at all —
+     see .chart-swipe-mask below — so the only motion left here is opacity. */
+  .chart-anim {
+    width: 100%;
+    height: 100%;
+    transition: opacity 180ms ease;
+  }
+
+  .chart-anim--fade-hidden {
+    opacity: 0;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .chart-anim {
+      transition: none;
+    }
+  }
+
+  /* Day-to-day swipe (see _slideSwitch in main.js): an overlay pinned exactly
+     over the chart's plot area — the axes, ticks and gridline labels around it
+     are deliberately outside this rectangle and stay put. It hides the live
+     canvas underneath (own background, so the rebuild behind it is invisible)
+     while .chart-swipe-track slides two frozen bitmaps of the plot — the day
+     being left, the day being entered — past each other. Position/size are set
+     inline per switch, since they come from the chart's own measured layout. */
+  .chart-swipe-mask {
+    position: absolute;
+    overflow: hidden;
+    background: var(--card-background-color);
+    pointer-events: none;
+  }
+
+  .chart-swipe-track {
     display: flex;
-    align-items: stretch;
-    gap: 4px;
+    height: 100%;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .chart-swipe-track {
+      transition: none;
+    }
+  }
+
+  /* The compact week band under the day chart, replacing the old day-nav row
+     (its arrows now flank .detail instead, its "Overview" button is this
+     whole element). Sits below the chart now, not above it: top margin is the
+     breathing room against the plot, and there is deliberately no bottom
+     margin — ha-card's own 6px bottom padding is what keeps this flush with
+     the card edge. Height comes from render()'s inline style (a fraction of
+     chart_height); position: relative plus that explicit height is what lets
+     Chart.js's responsive option size the canvas inside it. Click handling
+     for "return to overview" is a plain element listener rather than the
+     chart's own onClick, since a tap anywhere on the band should work, not
+     only where the chart resolves a data index. */
+  .band-wrap {
+    position: relative;
+    width: 100%;
     margin: 8px 0 0;
-  }
-
-  .day-nav__button {
-    appearance: none;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 4px 8px;
-    border: 1px solid var(--divider-color);
-    border-radius: 4px;
-    background: transparent;
-    color: var(--primary-text-color);
-    font: inherit;
-    font-size: 12px;
-    line-height: 1.2;
     cursor: pointer;
-    transition: background-color 100ms ease, border-color 100ms ease;
-  }
-
-  .day-nav__button:hover:not(:disabled) {
-    background: var(--secondary-background-color);
-  }
-
-  .day-nav__button:focus-visible {
-    outline: 2px solid var(--primary-color);
-    outline-offset: 1px;
-  }
-
-  .day-nav__button:disabled {
-    color: var(--secondary-text-color);
-    opacity: 0.45;
-    cursor: default;
-  }
-
-  .day-nav__button ha-icon {
-    --mdc-icon-size: 18px;
-  }
-
-  /* The middle button carries a label, the arrows only an icon. */
-  .day-nav__overview {
-    flex: 1 1 auto;
   }
 
   .message {
@@ -16509,6 +16842,17 @@ const LABELS = {
   show_detail_row: 'Show detail row',
   show_day_strip: 'Show day strip',
   round_temp: 'Round temperatures',
+  locale: 'Language',
+};
+
+// Labels for the header-extras attribute picker. Order matches
+// HEADER_EXTRA_ATTRIBUTES (forecast attribute first, then entity attributes).
+const HEADER_EXTRA_ATTRIBUTE_LABELS = {
+  precipitation_probability: 'Precipitation probability (hourly forecast)',
+  humidity: 'Humidity (weather entity attribute)',
+  wind_speed: 'Wind speed (weather entity attribute)',
+  pressure: 'Pressure (weather entity attribute)',
+  apparent_temperature: 'Apparent temperature (weather entity attribute)',
 };
 
 function computeLabel(schema) {
@@ -16516,12 +16860,14 @@ function computeLabel(schema) {
 }
 
 // Flat, top-level options only. `history.temperature` / `history.precipitation`
-// are handled by two dedicated ha-entity-picker elements below the form (they
-// need a different entity domain filter than `entity`, and nesting them into
-// this schema would require ha-form's object-selector, which has no sensible
-// widget). `temperature_gradient` and `precip_bands` are deliberately left out
-// entirely: both are arrays of nested `{ ... , color }` objects, and there is no
-// usable HA form widget for editing nested lists like that — they stay YAML-only.
+// and `header_extras` are handled by hand-written fields below the form (see
+// render()) — the first needs a different entity domain filter than `entity`,
+// the second is a small array of `{ attribute | entity, icon }` objects, and
+// nesting either into this schema would require ha-form's object-selector,
+// which has no sensible widget. `temperature_gradient` and `precip_bands` are
+// deliberately left out entirely: both are arrays of nested `{ ... , color }`
+// objects, and there is no usable HA form widget for editing nested lists
+// like that — they stay YAML-only.
 const SCHEMA = [
   { name: 'entity', required: true, selector: { entity: { domain: 'weather' } } },
   { name: 'title', selector: { text: {} } },
@@ -16546,6 +16892,19 @@ const SCHEMA = [
   { name: 'show_detail_row', selector: { boolean: {} } },
   { name: 'show_day_strip', selector: { boolean: {} } },
   { name: 'round_temp', selector: { boolean: {} } },
+  {
+    name: 'locale',
+    selector: {
+      select: {
+        mode: 'dropdown',
+        options: [
+          { value: '', label: "Home Assistant's language (default)" },
+          { value: 'de', label: 'Deutsch' },
+          { value: 'en', label: 'English' },
+        ],
+      },
+    },
+  },
 ];
 
 class BeautifulWeatherCardEditor extends s {
@@ -16564,7 +16923,8 @@ class BeautifulWeatherCardEditor extends s {
         gap: 16px;
       }
 
-      .history-fields {
+      .history-fields,
+      .header-extras-fields {
         display: flex;
         flex-direction: column;
         gap: 16px;
@@ -16574,6 +16934,19 @@ class BeautifulWeatherCardEditor extends s {
         font-size: 12px;
         color: var(--secondary-text-color);
         margin: -8px 0 0;
+      }
+
+      .header-extra-slot {
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+        padding: 8px 0;
+        border-top: 1px solid var(--divider-color);
+      }
+
+      .header-extra-slot:first-of-type {
+        border-top: none;
+        padding-top: 0;
       }
     `;
   }
@@ -16614,6 +16987,72 @@ class BeautifulWeatherCardEditor extends s {
     this._fireConfigChanged();
   }
 
+  // header_extras as currently configured, falling back to the default so a
+  // freshly-added card shows its one default slot instead of two empty ones.
+  get _headerExtras() {
+    return this._config.header_extras || DEFAULT_CONFIG.header_extras;
+  }
+
+  _headerExtraSourceChanged(index, ev) {
+    ev.stopPropagation();
+    const value = ev.detail.value;
+    const current = this._headerExtras[index] || {};
+
+    if (!value) {
+      this._setHeaderExtra(index, null);
+    } else if (value === '__entity__') {
+      this._setHeaderExtra(index, { entity: current.entity || '', ...(current.icon ? { icon: current.icon } : {}) });
+    } else {
+      this._setHeaderExtra(index, { attribute: value, ...(current.icon ? { icon: current.icon } : {}) });
+    }
+  }
+
+  _headerExtraEntityChanged(index, ev) {
+    ev.stopPropagation();
+    const current = this._headerExtras[index] || {};
+    this._setHeaderExtra(index, {
+      entity: ev.detail.value || '',
+      ...(current.icon ? { icon: current.icon } : {}),
+    });
+  }
+
+  _headerExtraIconChanged(index, ev) {
+    ev.stopPropagation();
+    const current = this._headerExtras[index] || {};
+    if (!current.attribute && !current.entity) {
+      return;
+    }
+    const next = { ...current };
+    if (ev.detail.value) {
+      next.icon = ev.detail.value;
+    } else {
+      delete next.icon;
+    }
+    this._setHeaderExtra(index, next);
+  }
+
+  // Writes one slot back into the array, drops trailing empty slots, and
+  // removes the config key entirely once nothing is left.
+  _setHeaderExtra(index, value) {
+    const extras = [...this._headerExtras];
+    extras[index] = value;
+
+    while (extras.length && !extras[extras.length - 1]) {
+      extras.pop();
+    }
+    const cleaned = extras.filter(Boolean).slice(0, HEADER_EXTRAS_MAX);
+
+    const config = { ...this._config };
+    if (cleaned.length) {
+      config.header_extras = cleaned;
+    } else {
+      delete config.header_extras;
+    }
+
+    this._config = config;
+    this._fireConfigChanged();
+  }
+
   _updateConfig(value) {
     this._config = { ...this._config, ...value };
     this._fireConfigChanged();
@@ -16626,6 +17065,62 @@ class BeautifulWeatherCardEditor extends s {
       composed: true,
     });
     this.dispatchEvent(event);
+  }
+
+  // One slot renders as a source picker (attribute or custom entity), plus an
+  // entity picker and/or icon picker once a source is chosen.
+  _renderHeaderExtraSlot(index) {
+    const extra = this._headerExtras[index] || {};
+    const sourceValue = extra.entity !== undefined ? '__entity__' : (extra.attribute || '');
+
+    return x`
+      <div class="header-extra-slot">
+        <ha-selector
+          .hass=${this.hass}
+          .selector=${{
+            select: {
+              mode: 'dropdown',
+              options: [
+                { value: '', label: `Extra value ${index + 1}: none` },
+                ...HEADER_EXTRA_ATTRIBUTES.map((attribute) => ({
+                  value: attribute,
+                  label: HEADER_EXTRA_ATTRIBUTE_LABELS[attribute],
+                })),
+                { value: '__entity__', label: 'Custom sensor entity…' },
+              ],
+            },
+          }}
+          .value=${sourceValue}
+          .label=${`Extra value ${index + 1}`}
+          @value-changed=${(ev) => this._headerExtraSourceChanged(index, ev)}
+        ></ha-selector>
+
+        ${sourceValue === '__entity__'
+          ? x`
+              <ha-entity-picker
+                .hass=${this.hass}
+                .value=${extra.entity || ''}
+                .label=${'Sensor entity'}
+                .includeDomains=${['sensor']}
+                allow-custom-entity
+                @value-changed=${(ev) => this._headerExtraEntityChanged(index, ev)}
+              ></ha-entity-picker>
+            `
+          : A}
+
+        ${sourceValue
+          ? x`
+              <ha-selector
+                .hass=${this.hass}
+                .selector=${{ icon: {} }}
+                .value=${extra.icon || ''}
+                .label=${'Icon (optional)'}
+                @value-changed=${(ev) => this._headerExtraIconChanged(index, ev)}
+              ></ha-selector>
+            `
+          : A}
+      </div>
+    `;
   }
 
   render() {
@@ -16643,6 +17138,13 @@ class BeautifulWeatherCardEditor extends s {
         .computeLabel=${computeLabel}
         @value-changed=${this._formChanged}
       ></ha-form>
+
+      <div class="header-extras-fields">
+        <p class="history-hint">
+          Up to two small values next to the current temperature in the header.
+        </p>
+        ${[0, 1].map((index) => this._renderHeaderExtraSlot(index))}
+      </div>
 
       <div class="history-fields">
         <p class="history-hint">
@@ -16684,6 +17186,22 @@ Chart.register(...registerables);
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+// The band under the day chart mirrors the overview, scaled down to a fraction
+// of the day chart's own configured height.
+const BAND_HEIGHT_RATIO = 0.2;
+
+// Default icon per header_extras attribute, used when a config entry does not
+// set its own `icon`. A custom `entity` slot prefers that entity's own icon
+// over this map — see _headerExtraSlot.
+const HEADER_EXTRA_DEFAULT_ICONS = {
+  precipitation_probability: 'mdi:umbrella',
+  humidity: 'mdi:water-percent',
+  wind_speed: 'mdi:weather-windy',
+  pressure: 'mdi:gauge',
+  apparent_temperature: 'mdi:thermometer',
+};
+const HEADER_EXTRA_FALLBACK_ICON = 'mdi:information-outline';
+
 // Whole calendar days between today and `date`, both taken in local time — which
 // is exactly what sliceForecast()'s `day_offset` counts.
 function dayOffsetFrom(date, now = new Date()) {
@@ -16715,6 +17233,59 @@ function chartSignature(mode, dayOffset, visibleDays, entries) {
   return [mode, dayOffset, visibleDays, entries.length, first, last].join('|');
 }
 
+// Copies the plot-area rectangle of a chart canvas (as reported by
+// buildMeteogramChartConfig's onLayout, in CSS pixels) into a same-content
+// offscreen canvas, in device pixels — the canvas backing store is
+// devicePixelRatio-scaled, so the source rectangle has to be too. Returns
+// null instead of throwing on anything that would leave a swipe with nothing
+// to show: a not-yet-painted canvas, a zero-size rectangle, drawImage
+// rejecting the source for any reason.
+function capturePlotBitmap(canvas, rect) {
+  if (!canvas || !rect) {
+    return null;
+  }
+
+  const dpr = window.devicePixelRatio || 1;
+  const width = Math.round((rect.right - rect.left) * dpr);
+  const height = Math.round((rect.bottom - rect.top) * dpr);
+  if (width <= 0 || height <= 0) {
+    return null;
+  }
+
+  const bitmap = document.createElement('canvas');
+  bitmap.width = width;
+  bitmap.height = height;
+
+  try {
+    const ctx = bitmap.getContext('2d');
+    if (!ctx) {
+      return null;
+    }
+    ctx.drawImage(
+      canvas,
+      Math.round(rect.left * dpr), Math.round(rect.top * dpr), width, height,
+      0, 0, width, height,
+    );
+  } catch (err) {
+    return null;
+  }
+
+  return bitmap;
+}
+
+// Sizes a captured bitmap for display at its original CSS size inside
+// .chart-swipe-track: the canvas's own width/height attributes are device
+// pixels (see capturePlotBitmap), so the visible size has to be set
+// separately via style — the same relationship the live chart canvas has
+// between its attribute size and its responsive CSS size.
+function styleBitmapCanvas(bitmap, cssWidth, cssHeight) {
+  bitmap.style.display = 'block';
+  bitmap.style.flex = 'none';
+  bitmap.style.width = `${cssWidth}px`;
+  bitmap.style.height = `${cssHeight}px`;
+  return bitmap;
+}
+
 class BeautifulWeatherCard extends s {
   static get properties() {
     return {
@@ -16727,6 +17298,7 @@ class BeautifulWeatherCard extends s {
       _dayOffset: { state: true },
       _visibleDays: { state: true },
       _stripHeight: { state: true },
+      _bandHeight: { state: true },
     };
   }
 
@@ -16742,11 +17314,27 @@ class BeautifulWeatherCard extends s {
     this._dayOffset = 0;
     this._visibleDays = MAX_STRIP_DAYS;
     this._stripHeight = 0;
+    this._bandHeight = 0;
+    // Full plot-area rectangle of the day chart, in CSS pixels, as last
+    // reported by buildMeteogramChartConfig's onLayout — kept around so a
+    // day-nav swipe knows what to freeze into a bitmap before it rebuilds the
+    // chart. Not reactive state: it never drives a render on its own.
+    this._lastLayout = null;
     this._chart = null;
     this._chartSignature = null;
+    this._bandChart = null;
+    this._bandChartSignature = null;
     this._forecastUnsub = null;
     this._subscribedEntity = null;
     this._resizeObserver = null;
+    // Set by _switchView right before it mutates state for a navigation-driven
+    // rebuild, consumed once by _renderChart to turn off Chart.js's own entrance
+    // animation for that one rebuild — see buildMeteogramChartConfig's `animate`.
+    this._navRebuildPending = false;
+    // True for the whole exit+enter duration of a _switchView transition, so a
+    // fast double click on the day-nav arrows (or a tap on the trend chart) is
+    // ignored instead of stacking a second transition on top of the first.
+    this._transitioning = false;
   }
 
   setConfig(config) {
@@ -16795,6 +17383,11 @@ class BeautifulWeatherCard extends s {
     if (this._chart) {
       this._chart.destroy();
       this._chart = null;
+    }
+
+    if (this._bandChart) {
+      this._bandChart.destroy();
+      this._bandChart = null;
     }
   }
 
@@ -16937,10 +17530,30 @@ class BeautifulWeatherCard extends s {
     return data.days;
   }
 
+  // Same shape as the overview mode's own data, independent of the day view
+  // currently open — used for the compact band under the day chart, which
+  // always shows the whole week regardless of which day is selected.
+  _trendData() {
+    if (!this._forecasts || !this._forecasts.length) {
+      return null;
+    }
+
+    const source = mergeMeasured(this._measured || [], this._forecasts);
+    return computeMeteogramData(source, 'trend', {
+      trend_days: this._trendDays(),
+      trend_bucket_hours: this._config.trend_bucket_hours,
+      temperature_gradient: this._config.temperature_gradient,
+      precip_bands: this._config.precip_bands,
+      round_temp: this._config.round_temp,
+    });
+  }
+
   updated(changed) {
     super.updated(changed);
     this._renderChart();
+    this._renderBandChart();
     this._measureStripHeight();
+    this._measureBandHeight();
   }
 
   // The day strip's real, current height — not a guessed constant, since its
@@ -16955,6 +17568,19 @@ class BeautifulWeatherCard extends s {
 
     if (height !== this._stripHeight) {
       this._stripHeight = height;
+    }
+  }
+
+  // Mirror of _measureStripHeight for the band under the day chart: its target
+  // height is itself computed from chart_height (see render()), but measured
+  // rather than assumed so the deduction below always matches what actually
+  // got laid out.
+  _measureBandHeight() {
+    const band = this.renderRoot && this.renderRoot.querySelector('.band-wrap');
+    const height = band ? band.getBoundingClientRect().height : 0;
+
+    if (height !== this._bandHeight) {
+      this._bandHeight = height;
     }
   }
 
@@ -16975,6 +17601,13 @@ class BeautifulWeatherCard extends s {
       return;
     }
 
+    // Consumed once per rebuild: true only for the rebuild that _switchView
+    // triggered by mutating state, false for every other rebuild (initial load,
+    // a fresh forecast arriving, a resize changing the visible day count) —
+    // those keep the ordinary fade-in.
+    const animate = !this._navRebuildPending;
+    this._navRebuildPending = false;
+
     if (this._chart) {
       this._chart.destroy();
     }
@@ -16987,19 +17620,77 @@ class BeautifulWeatherCard extends s {
       localize: (path, vars) => this._ll(path, vars),
       onSelect: (index) => this._onSelect(index, this._data()),
       // Chart.js knows where the plot area starts only after it has measured its
-      // axes; the day strip is padded to those edges from there.
-      onLayout: (area) => this._alignDayStrip(area),
+      // axes; the day strip is padded to those edges from there, and the area
+      // itself is kept for the next day-nav swipe (see _slideSwitch).
+      onLayout: (area) => this._onChartLayout(area),
       onHover: (index) => this._onHover(index),
       getActiveIndex: () => this._activeIndex(),
+      animate,
     });
 
     this._chart = new Chart(canvas.getContext('2d'), config);
     this._chartSignature = signature;
   }
 
+  // The compact overview band under the day chart — a second Chart.js
+  // instance, alive only in mode 'today'. A click anywhere on it (handled by
+  // the wrapping element in render(), not by the chart itself) returns to the
+  // full overview; picking a specific day happens there or via the day-nav
+  // arrows, not in the band.
+  _renderBandChart() {
+    const canvas = this.renderRoot && this.renderRoot.querySelector('#band-chart');
+
+    if (!canvas || this._mode !== 'today') {
+      if (this._bandChart) {
+        this._bandChart.destroy();
+        this._bandChart = null;
+        this._bandChartSignature = null;
+      }
+      return;
+    }
+
+    const data = this._trendData();
+    if (!data) {
+      return;
+    }
+
+    // Reuses chartSignature with a distinct mode tag: the band's data does not
+    // depend on dayOffset (it always covers the whole week), but activeDay —
+    // baked into the chart config at construction, not a live getter — does,
+    // so a day-nav step still has to rebuild. Hovering in the day chart above
+    // does not touch dayOffset, so it leaves this signature, and therefore
+    // this chart, untouched.
+    const signature = chartSignature('band', this._dayOffset, this._visibleDays, data.entries);
+    if (this._bandChart && signature === this._bandChartSignature) {
+      return;
+    }
+
+    if (this._bandChart) {
+      this._bandChart.destroy();
+    }
+
+    const config = buildMeteogramChartConfig({
+      data,
+      mode: 'trend',
+      cardConfig: this._config,
+      language: this._language,
+      localize: (path, vars) => this._ll(path, vars),
+      compact: true,
+      activeDay: this._dayOffset,
+    });
+
+    this._bandChart = new Chart(canvas.getContext('2d'), config);
+    this._bandChartSignature = signature;
+  }
+
   _alignDayStrip(area) {
     const strip = this.renderRoot && this.renderRoot.querySelector('.day-strip');
     alignDayStrip(strip, area);
+  }
+
+  _onChartLayout(area) {
+    this._lastLayout = area;
+    this._alignDayStrip(area);
   }
 
   // Index the detail row (and the chart's crosshair) shows: a hover overrides
@@ -17070,21 +17761,309 @@ class BeautifulWeatherCard extends s {
   _selectDay(offset) {
     const target = Math.min(Math.max(offset, 0), this._maxDayOffset());
 
-    this._mode = 'today';
-    this._dayOffset = target;
-    this._hoverIndex = null;
+    // Already there — day-nav's edge buttons are disabled at the boundary, but a
+    // tap that resolves to the day already open (e.g. the same day-strip tile)
+    // should not restart a transition into itself.
+    if (this._mode === 'today' && target === this._dayOffset) {
+      return;
+    }
 
-    // `_measured` always holds today's recorded hours; whether they belong in the
-    // current window is decided in _source(). Refreshed here so a day view opened
-    // hours after the card loaded is not missing the hours in between.
-    this._loadMeasured();
+    // From the day view, one day steps to its neighbour: swipe the plot area,
+    // direction from the sign of the change. From the overview (a day-strip
+    // tile or a tap in the trend chart), this opens a day view: a plain
+    // crossfade, same as _showOverview's way back.
+    const transition = this._mode === 'today'
+      ? { type: 'slide', direction: Math.sign(target - this._dayOffset) }
+      : { type: 'fade' };
+
+    this._switchView(transition, () => {
+      this._mode = 'today';
+      this._dayOffset = target;
+      this._hoverIndex = null;
+
+      // `_measured` always holds today's recorded hours; whether they belong in
+      // the current window is decided in _source(). Refreshed here so a day view
+      // opened hours after the card loaded is not missing the hours in between.
+      this._loadMeasured();
+    });
   }
 
   _showOverview() {
-    this._mode = 'trend';
-    this._dayOffset = 0;
-    this._hoverIndex = null;
-    this._loadMeasured();
+    if (this._mode === 'trend') {
+      return;
+    }
+
+    this._switchView({ type: 'fade' }, () => {
+      this._mode = 'trend';
+      this._dayOffset = 0;
+      this._hoverIndex = null;
+      this._loadMeasured();
+    });
+  }
+
+  // Encapsulates every mode/day switch: plays a transition, then applies the
+  // state change that actually swaps the data — which _renderChart picks up
+  // as a rebuild and, via _navRebuildPending, builds without Chart.js's own
+  // entrance animation so the two transitions don't fight each other. Two
+  // very different transitions share this entry point: a day-to-day step
+  // within the day view swipes the plot bitmap (_slideSwitch), any switch
+  // between overview and day view is a plain crossfade (_fadeSwitch).
+  //
+  // Ignored while a previous switch is still animating, so a fast double
+  // click cannot stack transitions or leave the chart mid-way. Falls back to
+  // applying the state immediately — no transition — when the user prefers
+  // reduced motion; the two switch methods have their own further fallbacks
+  // for when the DOM/layout they each need is not there.
+  _switchView(transition, applyState) {
+    if (this._transitioning) {
+      return;
+    }
+
+    if (this._prefersReducedMotion()) {
+      applyState();
+      return;
+    }
+
+    if (transition.type === 'slide') {
+      this._slideSwitch(transition.direction, applyState);
+      return;
+    }
+
+    this._fadeSwitch(applyState);
+  }
+
+  // Day-to-day navigation within the day view. Freezes the current plot area
+  // (axes/labels excluded — they live outside the rectangle onLayout reports
+  // and are left alone) as a bitmap, rebuilds the chart hidden behind an
+  // opaque mask so the rebuild itself is never visible, freezes the result as
+  // a second bitmap, then slides both across each other inside the mask.
+  // Once the swipe finishes the mask is removed outright — the live canvas
+  // underneath already shows the new day, so there is nothing left to swap.
+  //
+  // Falls back to applying the state with no animation at all — no mask ever
+  // created, or one created and then torn down — the moment any step can't
+  // deliver something to show: no known plot rectangle yet, the canvas not
+  // actually painted, drawImage rejecting the source.
+  async _slideSwitch(direction, applyState) {
+    const canvas = this.renderRoot && this.renderRoot.querySelector('#chart');
+    const chartWrap = this.renderRoot && this.renderRoot.querySelector('.chart-wrap');
+    const rect = this._lastLayout;
+    const oldBitmap = capturePlotBitmap(canvas, rect);
+
+    if (!chartWrap || !oldBitmap) {
+      applyState();
+      return;
+    }
+
+    const width = rect.right - rect.left;
+    const height = rect.bottom - rect.top;
+
+    const mask = document.createElement('div');
+    mask.className = 'chart-swipe-mask';
+    mask.style.left = `${rect.left}px`;
+    mask.style.top = `${rect.top}px`;
+    mask.style.width = `${width}px`;
+    mask.style.height = `${height}px`;
+
+    const track = document.createElement('div');
+    track.className = 'chart-swipe-track';
+    track.style.transition = 'none';
+    track.appendChild(styleBitmapCanvas(oldBitmap, width, height));
+    mask.appendChild(track);
+    chartWrap.appendChild(mask);
+
+    this._transitioning = true;
+    this._navRebuildPending = true;
+
+    try {
+      applyState();
+      await this.updateComplete;
+
+      const newCanvas = this.renderRoot && this.renderRoot.querySelector('#chart');
+      const newBitmap = capturePlotBitmap(newCanvas, this._lastLayout || rect);
+
+      if (!newBitmap) {
+        return;
+      }
+      styleBitmapCanvas(newBitmap, width, height);
+
+      // Next day slides left (old exits left, new enters from the right):
+      // append the new bitmap after the old one and later shift the track
+      // left by one plot-width. Previous day is the mirror: insert the new
+      // bitmap before the old one and start already shifted left by one
+      // plot-width, so the old bitmap — now the second child — sits exactly
+      // where it visually already was; shifting back to 0 then brings the
+      // new bitmap into view from the left. Both insertions happen with
+      // transitions off, so reordering the flex children is never itself
+      // animated — only the deliberate transform change below is.
+      const forward = direction >= 0;
+      if (forward) {
+        track.appendChild(newBitmap);
+      } else {
+        track.insertBefore(newBitmap, oldBitmap);
+        track.style.transform = `translateX(-${width}px)`;
+      }
+
+      // Commit the "before" position, then switch transitions on and move to
+      // the "after" one in a separate style write — the same reflow trick
+      // _onTransitionEnd's callers have always used to keep the two states
+      // from being coalesced into a no-op.
+      void track.offsetWidth;
+      track.style.transition = 'transform 200ms ease';
+      track.style.transform = forward ? `translateX(-${width}px)` : 'translateX(0)';
+
+      await new Promise((resolve) => this._onTransitionEnd(track, resolve));
+    } finally {
+      mask.remove();
+      this._transitioning = false;
+    }
+  }
+
+  // Mode switch (overview <-> day view): a plain opacity crossfade on the
+  // whole chart-anim element, nothing else — the zoom this used to play,
+  // scaled from wherever the day involved sat in the overview, is gone
+  // without replacement.
+  _fadeSwitch(applyState) {
+    const wrap = this.renderRoot && this.renderRoot.querySelector('.chart-anim');
+    if (!wrap) {
+      applyState();
+      return;
+    }
+
+    this._transitioning = true;
+    this._navRebuildPending = true;
+
+    this._onTransitionEnd(wrap, () => {
+      // Rebuild while still fully hidden — the class stays on throughout —
+      // then force a reflow before removing it, so the browser commits that
+      // hidden state as the definite "before" rather than folding the
+      // rebuild and the class removal into a single no-op step that skips
+      // the fade-in transition entirely.
+      applyState();
+      void wrap.offsetWidth;
+      wrap.classList.remove('chart-anim--fade-hidden');
+
+      this._onTransitionEnd(wrap, () => {
+        this._transitioning = false;
+      });
+    });
+
+    wrap.classList.add('chart-anim--fade-hidden');
+  }
+
+  // `transitionend` with a timeout fallback of the same order as the CSS
+  // duration, so a missed event — a property that never actually changed, a
+  // style recalculation that coalesces two transitions, prefers-reduced-motion
+  // disabling the transition after it was already started — cannot leave the
+  // chart stuck mid-switch.
+  _onTransitionEnd(el, callback) {
+    let done = false;
+    const finish = () => {
+      if (done) {
+        return;
+      }
+      done = true;
+      el.removeEventListener('transitionend', onEnd);
+      clearTimeout(timer);
+      callback();
+    };
+    const onEnd = (event) => {
+      if (event.target === el) {
+        finish();
+      }
+    };
+    el.addEventListener('transitionend', onEnd);
+    const timer = setTimeout(finish, 250);
+  }
+
+  _prefersReducedMotion() {
+    return typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
+  }
+
+  // The running hour's value for a forecast-sourced header_extras attribute
+  // (today only precipitation_probability) — independent of mode, the hovered
+  // index or the day currently open. Reuses nowIndex (the same lookup
+  // _renderDetail's "now" check relies on) rather than re-deriving "current
+  // hour" a second way; its 0 fallback for "not found" is guarded against here
+  // by re-checking the hour matches. Generalized from the single hardcoded
+  // probability lookup this used to be so any forecast attribute can reuse it.
+  _currentForecastAttribute(attribute) {
+    const source = this._source();
+    if (!source || !source.length) {
+      return null;
+    }
+
+    const now = new Date();
+    const entry = source[nowIndex(source, now)];
+    if (!entry) {
+      return null;
+    }
+
+    const dt = new Date(entry.datetime);
+    const isCurrentHour = dt.getFullYear() === now.getFullYear()
+      && dt.getMonth() === now.getMonth()
+      && dt.getDate() === now.getDate()
+      && dt.getHours() === now.getHours();
+
+    return isCurrentHour ? entry[attribute] : null;
+  }
+
+  // One header_extras slot's {icon, text}, or null when the value is not
+  // (yet) available — a null slot is left out of the header entirely rather
+  // than rendered empty, see _renderHeader.
+  _headerExtraSlot(extra) {
+    if (extra.entity) {
+      const state = this._hass.states[extra.entity];
+      if (!state || state.state === 'unknown' || state.state === 'unavailable') {
+        return null;
+      }
+
+      const unit = state.attributes.unit_of_measurement;
+      const numeric = Number(state.state);
+      const text = Number.isFinite(numeric)
+        ? `${Math.round(numeric * 10) / 10}${unit ? ` ${unit}` : ''}`
+        : `${state.state}${unit ? ` ${unit}` : ''}`;
+
+      return {
+        icon: extra.icon || state.attributes.icon || HEADER_EXTRA_FALLBACK_ICON,
+        text,
+      };
+    }
+
+    if (!extra.attribute) {
+      return null;
+    }
+
+    const icon = extra.icon || HEADER_EXTRA_DEFAULT_ICONS[extra.attribute] || HEADER_EXTRA_FALLBACK_ICON;
+
+    if (HEADER_EXTRA_FORECAST_ATTRIBUTES.includes(extra.attribute)) {
+      const value = this._currentForecastAttribute(extra.attribute);
+      return value == null ? null : { icon, text: `${Math.round(value)} %` };
+    }
+
+    if (HEADER_EXTRA_ENTITY_ATTRIBUTES.includes(extra.attribute)) {
+      const attrs = this._weather.attributes;
+      const raw = attrs[extra.attribute];
+      if (raw == null) {
+        return null;
+      }
+
+      const value = Math.round(raw);
+      switch (extra.attribute) {
+        case 'humidity':
+          return { icon, text: `${value} %` };
+        case 'wind_speed':
+          return { icon, text: `${value} ${attrs.wind_speed_unit || 'km/h'}` };
+        case 'pressure':
+          return { icon, text: `${value} ${attrs.pressure_unit || 'hPa'}` };
+        case 'apparent_temperature':
+          return { icon, text: `${value}°` };
+        default:
+          return null;
+      }
+    }
+
+    return null;
   }
 
   _renderHeader() {
@@ -17095,6 +18074,13 @@ class BeautifulWeatherCard extends s {
     const attrs = this._weather.attributes;
     const temp = attrs.temperature;
     const name = this._config.title || attrs.friendly_name || this._config.entity;
+    // Left of the temperature, in configuration order. A slot with no value
+    // right now is skipped entirely — the header's height comes from the icon
+    // and temperature, not from these, so nothing needs a reserved space.
+    const extras = (this._config.header_extras || [])
+      .slice(0, HEADER_EXTRAS_MAX)
+      .map((extra) => this._headerExtraSlot(extra))
+      .filter((slot) => slot != null);
 
     return x`
       <div class="header">
@@ -17103,6 +18089,12 @@ class BeautifulWeatherCard extends s {
           <div class="name">${name}</div>
           <div class="place">${this._ll(`condition.${this._weather.state}`) || this._weather.state}</div>
         </div>
+        ${extras.map((slot) => x`
+          <div class="header__extra">
+            <ha-icon class="header__extra-icon" .icon=${slot.icon}></ha-icon>
+            <span class="header__extra-value">${slot.text}</span>
+          </div>
+        `)}
         ${temp == null ? A : x`<div class="temp">${Math.round(temp)}°</div>`}
       </div>
     `;
@@ -17129,42 +18121,31 @@ class BeautifulWeatherCard extends s {
     });
   }
 
-  // Only the day view needs controls: step a day back or forward, or return to
-  // the week overview. The overview itself is navigated by tapping the chart.
-  _renderDayNav() {
+  // The compact week band under the day chart — a second chart, not this
+  // element's own click target list, decides which day it highlights; a click
+  // anywhere on it returns to the full overview (see render()'s onClick).
+  // Only present in the day view; the overview is reached from here or the
+  // day-nav arrows now living in the detail row (see _renderDetail).
+  _renderBand(height) {
     if (this._mode !== 'today') {
       return A;
     }
 
-    const max = this._maxDayOffset();
-
     return x`
-      <div class="day-nav">
-        <button
-          type="button"
-          class="day-nav__button"
-          title=${this._ll('previousDay')}
-          aria-label=${this._ll('previousDay')}
-          ?disabled=${this._dayOffset <= 0}
-          @click=${() => this._selectDay(this._dayOffset - 1)}
-        ><ha-icon .icon=${'mdi:chevron-left'}></ha-icon></button>
-        <button
-          type="button"
-          class="day-nav__button day-nav__overview"
-          @click=${() => this._showOverview()}
-        >${this._ll('overview')}</button>
-        <button
-          type="button"
-          class="day-nav__button"
-          title=${this._ll('nextDay')}
-          aria-label=${this._ll('nextDay')}
-          ?disabled=${this._dayOffset >= max}
-          @click=${() => this._selectDay(this._dayOffset + 1)}
-        ><ha-icon .icon=${'mdi:chevron-right'}></ha-icon></button>
+      <div
+        class="band-wrap"
+        style="height: ${height}px"
+        title=${this._ll('overview')}
+        @click=${() => this._showOverview()}
+      >
+        <canvas id="band-chart"></canvas>
       </div>
     `;
   }
 
+  // Day-nav arrows now live at the outer edges of the detail row rather than
+  // in a row of their own below the chart — the "Overview" button they used
+  // to flank is gone; the band under the chart (see _renderBand) replaces it.
   _renderDetail(data) {
     if (!this._config.show_detail_row || this._mode !== 'today' || !data) {
       return A;
@@ -17185,18 +18166,65 @@ class BeautifulWeatherCard extends s {
       minute: '2-digit',
     });
     const precip = entry.precipitation == null ? 0 : entry.precipitation;
+    const probability = entry.precipitation_probability == null
+      ? '–'
+      : `${Math.round(entry.precipitation_probability)} %`;
+    const wind = entry.wind_speed == null
+      ? '–'
+      : `${Math.round(entry.wind_speed)} km/h`;
 
+    // The day currently shown, not the hovered hour — so it stays put while
+    // hovering moves the time/value columns next to it.
+    const dayDate = new Date(data.entries[0].datetime);
+    const dayLabel = dayDate.toLocaleDateString(this._language, {
+      weekday: 'short',
+      day: '2-digit',
+      month: '2-digit',
+    });
+    const max = this._maxDayOffset();
+
+    // Every slot is always rendered — a missing value becomes "–" rather than
+    // disappearing — inside a fixed-column grid (see .detail in styles.js), so
+    // hovering across hours never reflows or resizes the row, and neither do
+    // the arrows changing between enabled/disabled at the range's edges.
     return x`
       <div class="detail">
-        <span class="time">${isNow ? this._ll('now') : time}</span>
-        <span class="item">${this._ll('temperature')} <b>${entry.temperature}°</b></span>
-        <span class="item">${this._ll('precipitation')} <b>${precip.toFixed(1)} mm</b></span>
-        ${entry.precipitation_probability == null
-          ? A
-          : x`<span class="item">${this._ll('probability')} <b>${Math.round(entry.precipitation_probability)} %</b></span>`}
-        ${entry.wind_speed == null
-          ? A
-          : x`<span class="item">${this._ll('wind')} <b>${Math.round(entry.wind_speed)} km/h</b></span>`}
+        <button
+          type="button"
+          class="detail__nav"
+          title=${this._ll('previousDay')}
+          aria-label=${this._ll('previousDay')}
+          ?disabled=${this._dayOffset <= 0}
+          @click=${() => this._selectDay(this._dayOffset - 1)}
+        ><ha-icon .icon=${'mdi:chevron-left'}></ha-icon></button>
+        <span class="detail__date">
+          <span class="detail__weekday">${dayLabel}</span>
+          <span class="detail__time">${isNow ? this._ll('now') : time}</span>
+        </span>
+        <span class="detail__item" title=${this._ll('temperature')}>
+          <ha-icon class="detail__icon" .icon=${'mdi:thermometer'}></ha-icon>
+          <span class="detail__value">${entry.temperature}°</span>
+        </span>
+        <span class="detail__item" title=${this._ll('precipitation')}>
+          <ha-icon class="detail__icon" .icon=${'mdi:weather-pouring'}></ha-icon>
+          <span class="detail__value">${precip.toFixed(1)} mm</span>
+        </span>
+        <span class="detail__item" title=${this._ll('probability')}>
+          <ha-icon class="detail__icon" .icon=${'mdi:umbrella'}></ha-icon>
+          <span class="detail__value">${probability}</span>
+        </span>
+        <span class="detail__item" title=${this._ll('wind')}>
+          <ha-icon class="detail__icon" .icon=${'mdi:weather-windy'}></ha-icon>
+          <span class="detail__value">${wind}</span>
+        </span>
+        <button
+          type="button"
+          class="detail__nav"
+          title=${this._ll('nextDay')}
+          aria-label=${this._ll('nextDay')}
+          ?disabled=${this._dayOffset >= max}
+          @click=${() => this._selectDay(this._dayOffset + 1)}
+        ><ha-icon .icon=${'mdi:chevron-right'}></ha-icon></button>
       </div>
     `;
   }
@@ -17215,15 +18243,20 @@ class BeautifulWeatherCard extends s {
     }
 
     const data = this._data();
-    // The day strip's own height is measured in updated(); while it is showing
-    // (the overview), the chart gives up exactly that much space so both
-    // modes add up to the same total. The nav row below the chart exists only
-    // in the day view, but is deliberately not offset against the strip here —
-    // that would trade one guessed constant for another; only the strip's
-    // real, measured height is worth compensating for.
-    const chartHeight = this._stripHeight > 0
-      ? Math.max(0, this._config.chart_height - this._stripHeight)
+    // Two extra elements share the same height budget as the chart, one per
+    // mode: the day strip (overview only) and the band (day view only). Each
+    // one's own real, measured height is what gets deducted here — a guessed
+    // constant would drift the moment its content (a wrapped label, the
+    // band's rounded target height) changes. Whichever mode is not active has
+    // its measurement pinned at 0 since its element does not exist to measure.
+    const reservedHeight = this._mode === 'trend' ? this._stripHeight : this._bandHeight;
+    const chartHeight = reservedHeight > 0
+      ? Math.max(0, this._config.chart_height - reservedHeight)
       : this._config.chart_height;
+    // Target, not measured: the band's own height request, a fifth of the day
+    // chart's budget. _measureBandHeight() reads back what this actually laid
+    // out to feed the deduction above.
+    const bandHeight = Math.round(this._config.chart_height * BAND_HEIGHT_RATIO);
 
     return x`
       <ha-card>
@@ -17234,9 +18267,11 @@ class BeautifulWeatherCard extends s {
           class="chart-wrap ${this._mode === 'trend' ? 'chart-wrap--clickable' : ''}"
           style="height: ${chartHeight}px"
         >
-          <canvas id="chart"></canvas>
+          <div class="chart-anim">
+            <canvas id="chart"></canvas>
+          </div>
         </div>
-        ${this._renderDayNav()}
+        ${this._renderBand(bandHeight)}
       </ha-card>
     `;
   }

@@ -61,6 +61,26 @@ export const cardStyles = css`
     flex: 0 0 auto;
   }
 
+  /* header_extras: up to two small values left of the temperature, in
+     configuration order (see HEADER_EXTRAS_MAX / _renderHeader in main.js). A
+     slot with no value right now is left out of the DOM entirely rather than
+     rendered empty — the header's height already comes from the icon and
+     temperature next to these, so nothing here needs to reserve space. */
+  .header .header__extra {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    color: var(--secondary-text-color);
+    font-size: 12px;
+    white-space: nowrap;
+  }
+
+  .header .header__extra-icon {
+    --mdc-icon-size: 16px;
+    flex: 0 0 auto;
+  }
+
   /* One tile per day, each exactly as wide as that day's stretch of the chart
      below. No gaps and no scrolling: the strip is a header for the plot area,
      and its horizontal padding is set from the chart's own layout (see
@@ -159,9 +179,23 @@ export const cardStyles = css`
     color: var(--secondary-text-color);
   }
 
+  /* Second, smaller line below min/max: daily precipitation total (sunshine
+     hours would join it here if the forecast ever carries that field — see
+     computeMeteogramData in meteogram/data.js). */
+  .day-strip__extra {
+    font-size: 10px;
+    color: var(--secondary-text-color);
+    white-space: nowrap;
+  }
+
   /* A part-day at the start of the overview owns only a sliver of the chart.
      Its tile keeps that width and drops what no longer fits, instead of
-     clipping glyphs in half. */
+     clipping glyphs in half. Shrink order: the precipitation row first, then
+     min/max, then icon and label. */
+  .day-strip__tile--compact .day-strip__extra {
+    display: none;
+  }
+
   .day-strip__tile--tight .day-strip__temps {
     display: none;
   }
@@ -171,102 +205,184 @@ export const cardStyles = css`
     display: none;
   }
 
-  /* Value bar between strip and chart: hairline-boxed single line, grey labels,
-     values in text colour. Fixed height keeps the chart from jumping when the
-     selected hour has fewer values. */
+  /* Value row between strip and chart: a fixed-column grid instead of the
+     previous wrapping flex row. Every slot is always present (a missing value
+     renders as "–", never as nothing), and the grid tracks are sized by
+     minmax(0, 1fr) or a fixed width rather than by their content, so neither a
+     one-digit/three-digit value nor "Jetzt" vs. a five-character time ever
+     changes a column's width. Combined with a fixed height (not a
+     min-height), that is what keeps the row from jumping or rewrapping on
+     every hover — including the day-nav arrows now living at its outer edges,
+     which flip between enabled and disabled without moving anything next to
+     them. Icons replace spelled-out labels so the row never wraps on narrow
+     cards. */
   .detail {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: baseline;
-    gap: 0 14px;
-    min-height: 22px;
-    padding: 4px 0 5px;
+    display: grid;
+    grid-template-columns: 24px 7.5em repeat(4, minmax(0, 1fr)) 24px;
+    align-items: center;
+    column-gap: 8px;
+    height: 26px;
+    padding: 0;
     margin-bottom: 4px;
     border-top: 1px solid var(--divider-color);
     border-bottom: 1px solid var(--divider-color);
-    font-size: 11px;
-    line-height: 1.4;
-    color: var(--secondary-text-color);
+    font-variant-numeric: tabular-nums;
+    overflow: hidden;
   }
 
-  .detail .time {
+  /* Day-nav's back/forward arrows, now flanking the detail row instead of
+     sitting in a row of their own below the chart. */
+  .detail__nav {
+    appearance: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--primary-text-color);
+    cursor: pointer;
+  }
+
+  .detail__nav ha-icon {
+    --mdc-icon-size: 18px;
+  }
+
+  .detail__nav:disabled {
+    color: var(--secondary-text-color);
+    opacity: 0.45;
+    cursor: default;
+  }
+
+  .detail__nav:focus-visible {
+    outline: 2px solid var(--primary-color);
+    outline-offset: -1px;
+  }
+
+  /* Weekday + date of the day currently shown, with the hovered hour's time
+     (or "Jetzt") beside it — a quiet spot for that read-out now that it no
+     longer heads the row on its own. */
+  .detail__date {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .detail__weekday {
     font-size: 13px;
     font-weight: 500;
     color: var(--primary-text-color);
-    min-width: 3.2em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
-  .detail .item {
-    display: inline-flex;
-    align-items: baseline;
-    gap: 4px;
+  .detail__time {
+    font-size: 11px;
+    color: var(--secondary-text-color);
     white-space: nowrap;
   }
 
-  .detail .item b {
+  .detail__item {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+  }
+
+  .detail__icon {
+    --mdc-icon-size: 16px;
+    color: var(--secondary-text-color);
+    flex: 0 0 auto;
+  }
+
+  .detail__value {
     font-size: 13px;
-    font-weight: 400;
     color: var(--primary-text-color);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .chart-wrap {
     position: relative;
     width: 100%;
+    /* Clips the sliding/zooming .chart-anim content below so a transition
+       never grows the card or is visible outside the chart area. */
+    overflow: hidden;
   }
 
   .chart-wrap--clickable {
     cursor: pointer;
   }
 
-  /* Sits below the chart now, not above it: top margin is the breathing room
-     against the plot, and there is deliberately no bottom margin — ha-card's
-     own 6px bottom padding is what keeps this flush with the card edge. */
-  .day-nav {
+  /* Wraps the canvas so a mode switch (see _fadeSwitch in main.js) can
+     crossfade this layer alone: chart-wrap keeps its own fixed height
+     throughout, so neither the card nor the day strip above it ever moves.
+     The class is toggled imperatively from main.js rather than bound in the
+     Lit template, so it survives the re-render that swaps the chart
+     underneath. Day-to-day navigation no longer touches this element at all —
+     see .chart-swipe-mask below — so the only motion left here is opacity. */
+  .chart-anim {
+    width: 100%;
+    height: 100%;
+    transition: opacity 180ms ease;
+  }
+
+  .chart-anim--fade-hidden {
+    opacity: 0;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .chart-anim {
+      transition: none;
+    }
+  }
+
+  /* Day-to-day swipe (see _slideSwitch in main.js): an overlay pinned exactly
+     over the chart's plot area — the axes, ticks and gridline labels around it
+     are deliberately outside this rectangle and stay put. It hides the live
+     canvas underneath (own background, so the rebuild behind it is invisible)
+     while .chart-swipe-track slides two frozen bitmaps of the plot — the day
+     being left, the day being entered — past each other. Position/size are set
+     inline per switch, since they come from the chart's own measured layout. */
+  .chart-swipe-mask {
+    position: absolute;
+    overflow: hidden;
+    background: var(--card-background-color);
+    pointer-events: none;
+  }
+
+  .chart-swipe-track {
     display: flex;
-    align-items: stretch;
-    gap: 4px;
+    height: 100%;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .chart-swipe-track {
+      transition: none;
+    }
+  }
+
+  /* The compact week band under the day chart, replacing the old day-nav row
+     (its arrows now flank .detail instead, its "Overview" button is this
+     whole element). Sits below the chart now, not above it: top margin is the
+     breathing room against the plot, and there is deliberately no bottom
+     margin — ha-card's own 6px bottom padding is what keeps this flush with
+     the card edge. Height comes from render()'s inline style (a fraction of
+     chart_height); position: relative plus that explicit height is what lets
+     Chart.js's responsive option size the canvas inside it. Click handling
+     for "return to overview" is a plain element listener rather than the
+     chart's own onClick, since a tap anywhere on the band should work, not
+     only where the chart resolves a data index. */
+  .band-wrap {
+    position: relative;
+    width: 100%;
     margin: 8px 0 0;
-  }
-
-  .day-nav__button {
-    appearance: none;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 4px 8px;
-    border: 1px solid var(--divider-color);
-    border-radius: 4px;
-    background: transparent;
-    color: var(--primary-text-color);
-    font: inherit;
-    font-size: 12px;
-    line-height: 1.2;
     cursor: pointer;
-    transition: background-color 100ms ease, border-color 100ms ease;
-  }
-
-  .day-nav__button:hover:not(:disabled) {
-    background: var(--secondary-background-color);
-  }
-
-  .day-nav__button:focus-visible {
-    outline: 2px solid var(--primary-color);
-    outline-offset: 1px;
-  }
-
-  .day-nav__button:disabled {
-    color: var(--secondary-text-color);
-    opacity: 0.45;
-    cursor: default;
-  }
-
-  .day-nav__button ha-icon {
-    --mdc-icon-size: 18px;
-  }
-
-  /* The middle button carries a label, the arrows only an icon. */
-  .day-nav__overview {
-    flex: 1 1 auto;
   }
 
   .message {

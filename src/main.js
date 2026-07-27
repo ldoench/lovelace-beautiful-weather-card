@@ -1,6 +1,14 @@
 import { LitElement, html, nothing } from 'lit';
 import { Chart, registerables } from 'chart.js';
-import { CARD_VERSION, DEFAULT_CONFIG, WeatherEntityFeature, conditionIcon } from './const.js';
+import {
+  CARD_VERSION,
+  DEFAULT_CONFIG,
+  HEADER_EXTRA_ENTITY_ATTRIBUTES,
+  HEADER_EXTRA_FORECAST_ATTRIBUTES,
+  HEADER_EXTRAS_MAX,
+  WeatherEntityFeature,
+  conditionIcon,
+} from './const.js';
 import { localize } from './locale.js';
 import { computeMeteogramData } from './meteogram/data.js';
 import { buildMeteogramChartConfig } from './meteogram/chart.js';
@@ -12,6 +20,22 @@ import './card-editor.js';
 Chart.register(...registerables);
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+// The band under the day chart mirrors the overview, scaled down to a fraction
+// of the day chart's own configured height.
+const BAND_HEIGHT_RATIO = 0.2;
+
+// Default icon per header_extras attribute, used when a config entry does not
+// set its own `icon`. A custom `entity` slot prefers that entity's own icon
+// over this map — see _headerExtraSlot.
+const HEADER_EXTRA_DEFAULT_ICONS = {
+  precipitation_probability: 'mdi:umbrella',
+  humidity: 'mdi:water-percent',
+  wind_speed: 'mdi:weather-windy',
+  pressure: 'mdi:gauge',
+  apparent_temperature: 'mdi:thermometer',
+};
+const HEADER_EXTRA_FALLBACK_ICON = 'mdi:information-outline';
 
 // Whole calendar days between today and `date`, both taken in local time — which
 // is exactly what sliceForecast()'s `day_offset` counts.
@@ -44,6 +68,59 @@ function chartSignature(mode, dayOffset, visibleDays, entries) {
   return [mode, dayOffset, visibleDays, entries.length, first, last].join('|');
 }
 
+// Copies the plot-area rectangle of a chart canvas (as reported by
+// buildMeteogramChartConfig's onLayout, in CSS pixels) into a same-content
+// offscreen canvas, in device pixels — the canvas backing store is
+// devicePixelRatio-scaled, so the source rectangle has to be too. Returns
+// null instead of throwing on anything that would leave a swipe with nothing
+// to show: a not-yet-painted canvas, a zero-size rectangle, drawImage
+// rejecting the source for any reason.
+function capturePlotBitmap(canvas, rect) {
+  if (!canvas || !rect) {
+    return null;
+  }
+
+  const dpr = window.devicePixelRatio || 1;
+  const width = Math.round((rect.right - rect.left) * dpr);
+  const height = Math.round((rect.bottom - rect.top) * dpr);
+  if (width <= 0 || height <= 0) {
+    return null;
+  }
+
+  const bitmap = document.createElement('canvas');
+  bitmap.width = width;
+  bitmap.height = height;
+
+  try {
+    const ctx = bitmap.getContext('2d');
+    if (!ctx) {
+      return null;
+    }
+    ctx.drawImage(
+      canvas,
+      Math.round(rect.left * dpr), Math.round(rect.top * dpr), width, height,
+      0, 0, width, height,
+    );
+  } catch (err) {
+    return null;
+  }
+
+  return bitmap;
+}
+
+// Sizes a captured bitmap for display at its original CSS size inside
+// .chart-swipe-track: the canvas's own width/height attributes are device
+// pixels (see capturePlotBitmap), so the visible size has to be set
+// separately via style — the same relationship the live chart canvas has
+// between its attribute size and its responsive CSS size.
+function styleBitmapCanvas(bitmap, cssWidth, cssHeight) {
+  bitmap.style.display = 'block';
+  bitmap.style.flex = 'none';
+  bitmap.style.width = `${cssWidth}px`;
+  bitmap.style.height = `${cssHeight}px`;
+  return bitmap;
+}
+
 class BeautifulWeatherCard extends LitElement {
   static get properties() {
     return {
@@ -56,6 +133,7 @@ class BeautifulWeatherCard extends LitElement {
       _dayOffset: { state: true },
       _visibleDays: { state: true },
       _stripHeight: { state: true },
+      _bandHeight: { state: true },
     };
   }
 
@@ -71,11 +149,27 @@ class BeautifulWeatherCard extends LitElement {
     this._dayOffset = 0;
     this._visibleDays = MAX_STRIP_DAYS;
     this._stripHeight = 0;
+    this._bandHeight = 0;
+    // Full plot-area rectangle of the day chart, in CSS pixels, as last
+    // reported by buildMeteogramChartConfig's onLayout — kept around so a
+    // day-nav swipe knows what to freeze into a bitmap before it rebuilds the
+    // chart. Not reactive state: it never drives a render on its own.
+    this._lastLayout = null;
     this._chart = null;
     this._chartSignature = null;
+    this._bandChart = null;
+    this._bandChartSignature = null;
     this._forecastUnsub = null;
     this._subscribedEntity = null;
     this._resizeObserver = null;
+    // Set by _switchView right before it mutates state for a navigation-driven
+    // rebuild, consumed once by _renderChart to turn off Chart.js's own entrance
+    // animation for that one rebuild — see buildMeteogramChartConfig's `animate`.
+    this._navRebuildPending = false;
+    // True for the whole exit+enter duration of a _switchView transition, so a
+    // fast double click on the day-nav arrows (or a tap on the trend chart) is
+    // ignored instead of stacking a second transition on top of the first.
+    this._transitioning = false;
   }
 
   setConfig(config) {
@@ -124,6 +218,11 @@ class BeautifulWeatherCard extends LitElement {
     if (this._chart) {
       this._chart.destroy();
       this._chart = null;
+    }
+
+    if (this._bandChart) {
+      this._bandChart.destroy();
+      this._bandChart = null;
     }
   }
 
@@ -266,10 +365,30 @@ class BeautifulWeatherCard extends LitElement {
     return data.days;
   }
 
+  // Same shape as the overview mode's own data, independent of the day view
+  // currently open — used for the compact band under the day chart, which
+  // always shows the whole week regardless of which day is selected.
+  _trendData() {
+    if (!this._forecasts || !this._forecasts.length) {
+      return null;
+    }
+
+    const source = mergeMeasured(this._measured || [], this._forecasts);
+    return computeMeteogramData(source, 'trend', {
+      trend_days: this._trendDays(),
+      trend_bucket_hours: this._config.trend_bucket_hours,
+      temperature_gradient: this._config.temperature_gradient,
+      precip_bands: this._config.precip_bands,
+      round_temp: this._config.round_temp,
+    });
+  }
+
   updated(changed) {
     super.updated(changed);
     this._renderChart();
+    this._renderBandChart();
     this._measureStripHeight();
+    this._measureBandHeight();
   }
 
   // The day strip's real, current height — not a guessed constant, since its
@@ -284,6 +403,19 @@ class BeautifulWeatherCard extends LitElement {
 
     if (height !== this._stripHeight) {
       this._stripHeight = height;
+    }
+  }
+
+  // Mirror of _measureStripHeight for the band under the day chart: its target
+  // height is itself computed from chart_height (see render()), but measured
+  // rather than assumed so the deduction below always matches what actually
+  // got laid out.
+  _measureBandHeight() {
+    const band = this.renderRoot && this.renderRoot.querySelector('.band-wrap');
+    const height = band ? band.getBoundingClientRect().height : 0;
+
+    if (height !== this._bandHeight) {
+      this._bandHeight = height;
     }
   }
 
@@ -304,6 +436,13 @@ class BeautifulWeatherCard extends LitElement {
       return;
     }
 
+    // Consumed once per rebuild: true only for the rebuild that _switchView
+    // triggered by mutating state, false for every other rebuild (initial load,
+    // a fresh forecast arriving, a resize changing the visible day count) —
+    // those keep the ordinary fade-in.
+    const animate = !this._navRebuildPending;
+    this._navRebuildPending = false;
+
     if (this._chart) {
       this._chart.destroy();
     }
@@ -316,19 +455,77 @@ class BeautifulWeatherCard extends LitElement {
       localize: (path, vars) => this._ll(path, vars),
       onSelect: (index) => this._onSelect(index, this._data()),
       // Chart.js knows where the plot area starts only after it has measured its
-      // axes; the day strip is padded to those edges from there.
-      onLayout: (area) => this._alignDayStrip(area),
+      // axes; the day strip is padded to those edges from there, and the area
+      // itself is kept for the next day-nav swipe (see _slideSwitch).
+      onLayout: (area) => this._onChartLayout(area),
       onHover: (index) => this._onHover(index),
       getActiveIndex: () => this._activeIndex(),
+      animate,
     });
 
     this._chart = new Chart(canvas.getContext('2d'), config);
     this._chartSignature = signature;
   }
 
+  // The compact overview band under the day chart — a second Chart.js
+  // instance, alive only in mode 'today'. A click anywhere on it (handled by
+  // the wrapping element in render(), not by the chart itself) returns to the
+  // full overview; picking a specific day happens there or via the day-nav
+  // arrows, not in the band.
+  _renderBandChart() {
+    const canvas = this.renderRoot && this.renderRoot.querySelector('#band-chart');
+
+    if (!canvas || this._mode !== 'today') {
+      if (this._bandChart) {
+        this._bandChart.destroy();
+        this._bandChart = null;
+        this._bandChartSignature = null;
+      }
+      return;
+    }
+
+    const data = this._trendData();
+    if (!data) {
+      return;
+    }
+
+    // Reuses chartSignature with a distinct mode tag: the band's data does not
+    // depend on dayOffset (it always covers the whole week), but activeDay —
+    // baked into the chart config at construction, not a live getter — does,
+    // so a day-nav step still has to rebuild. Hovering in the day chart above
+    // does not touch dayOffset, so it leaves this signature, and therefore
+    // this chart, untouched.
+    const signature = chartSignature('band', this._dayOffset, this._visibleDays, data.entries);
+    if (this._bandChart && signature === this._bandChartSignature) {
+      return;
+    }
+
+    if (this._bandChart) {
+      this._bandChart.destroy();
+    }
+
+    const config = buildMeteogramChartConfig({
+      data,
+      mode: 'trend',
+      cardConfig: this._config,
+      language: this._language,
+      localize: (path, vars) => this._ll(path, vars),
+      compact: true,
+      activeDay: this._dayOffset,
+    });
+
+    this._bandChart = new Chart(canvas.getContext('2d'), config);
+    this._bandChartSignature = signature;
+  }
+
   _alignDayStrip(area) {
     const strip = this.renderRoot && this.renderRoot.querySelector('.day-strip');
     alignDayStrip(strip, area);
+  }
+
+  _onChartLayout(area) {
+    this._lastLayout = area;
+    this._alignDayStrip(area);
   }
 
   // Index the detail row (and the chart's crosshair) shows: a hover overrides
@@ -399,21 +596,309 @@ class BeautifulWeatherCard extends LitElement {
   _selectDay(offset) {
     const target = Math.min(Math.max(offset, 0), this._maxDayOffset());
 
-    this._mode = 'today';
-    this._dayOffset = target;
-    this._hoverIndex = null;
+    // Already there — day-nav's edge buttons are disabled at the boundary, but a
+    // tap that resolves to the day already open (e.g. the same day-strip tile)
+    // should not restart a transition into itself.
+    if (this._mode === 'today' && target === this._dayOffset) {
+      return;
+    }
 
-    // `_measured` always holds today's recorded hours; whether they belong in the
-    // current window is decided in _source(). Refreshed here so a day view opened
-    // hours after the card loaded is not missing the hours in between.
-    this._loadMeasured();
+    // From the day view, one day steps to its neighbour: swipe the plot area,
+    // direction from the sign of the change. From the overview (a day-strip
+    // tile or a tap in the trend chart), this opens a day view: a plain
+    // crossfade, same as _showOverview's way back.
+    const transition = this._mode === 'today'
+      ? { type: 'slide', direction: Math.sign(target - this._dayOffset) }
+      : { type: 'fade' };
+
+    this._switchView(transition, () => {
+      this._mode = 'today';
+      this._dayOffset = target;
+      this._hoverIndex = null;
+
+      // `_measured` always holds today's recorded hours; whether they belong in
+      // the current window is decided in _source(). Refreshed here so a day view
+      // opened hours after the card loaded is not missing the hours in between.
+      this._loadMeasured();
+    });
   }
 
   _showOverview() {
-    this._mode = 'trend';
-    this._dayOffset = 0;
-    this._hoverIndex = null;
-    this._loadMeasured();
+    if (this._mode === 'trend') {
+      return;
+    }
+
+    this._switchView({ type: 'fade' }, () => {
+      this._mode = 'trend';
+      this._dayOffset = 0;
+      this._hoverIndex = null;
+      this._loadMeasured();
+    });
+  }
+
+  // Encapsulates every mode/day switch: plays a transition, then applies the
+  // state change that actually swaps the data — which _renderChart picks up
+  // as a rebuild and, via _navRebuildPending, builds without Chart.js's own
+  // entrance animation so the two transitions don't fight each other. Two
+  // very different transitions share this entry point: a day-to-day step
+  // within the day view swipes the plot bitmap (_slideSwitch), any switch
+  // between overview and day view is a plain crossfade (_fadeSwitch).
+  //
+  // Ignored while a previous switch is still animating, so a fast double
+  // click cannot stack transitions or leave the chart mid-way. Falls back to
+  // applying the state immediately — no transition — when the user prefers
+  // reduced motion; the two switch methods have their own further fallbacks
+  // for when the DOM/layout they each need is not there.
+  _switchView(transition, applyState) {
+    if (this._transitioning) {
+      return;
+    }
+
+    if (this._prefersReducedMotion()) {
+      applyState();
+      return;
+    }
+
+    if (transition.type === 'slide') {
+      this._slideSwitch(transition.direction, applyState);
+      return;
+    }
+
+    this._fadeSwitch(applyState);
+  }
+
+  // Day-to-day navigation within the day view. Freezes the current plot area
+  // (axes/labels excluded — they live outside the rectangle onLayout reports
+  // and are left alone) as a bitmap, rebuilds the chart hidden behind an
+  // opaque mask so the rebuild itself is never visible, freezes the result as
+  // a second bitmap, then slides both across each other inside the mask.
+  // Once the swipe finishes the mask is removed outright — the live canvas
+  // underneath already shows the new day, so there is nothing left to swap.
+  //
+  // Falls back to applying the state with no animation at all — no mask ever
+  // created, or one created and then torn down — the moment any step can't
+  // deliver something to show: no known plot rectangle yet, the canvas not
+  // actually painted, drawImage rejecting the source.
+  async _slideSwitch(direction, applyState) {
+    const canvas = this.renderRoot && this.renderRoot.querySelector('#chart');
+    const chartWrap = this.renderRoot && this.renderRoot.querySelector('.chart-wrap');
+    const rect = this._lastLayout;
+    const oldBitmap = capturePlotBitmap(canvas, rect);
+
+    if (!chartWrap || !oldBitmap) {
+      applyState();
+      return;
+    }
+
+    const width = rect.right - rect.left;
+    const height = rect.bottom - rect.top;
+
+    const mask = document.createElement('div');
+    mask.className = 'chart-swipe-mask';
+    mask.style.left = `${rect.left}px`;
+    mask.style.top = `${rect.top}px`;
+    mask.style.width = `${width}px`;
+    mask.style.height = `${height}px`;
+
+    const track = document.createElement('div');
+    track.className = 'chart-swipe-track';
+    track.style.transition = 'none';
+    track.appendChild(styleBitmapCanvas(oldBitmap, width, height));
+    mask.appendChild(track);
+    chartWrap.appendChild(mask);
+
+    this._transitioning = true;
+    this._navRebuildPending = true;
+
+    try {
+      applyState();
+      await this.updateComplete;
+
+      const newCanvas = this.renderRoot && this.renderRoot.querySelector('#chart');
+      const newBitmap = capturePlotBitmap(newCanvas, this._lastLayout || rect);
+
+      if (!newBitmap) {
+        return;
+      }
+      styleBitmapCanvas(newBitmap, width, height);
+
+      // Next day slides left (old exits left, new enters from the right):
+      // append the new bitmap after the old one and later shift the track
+      // left by one plot-width. Previous day is the mirror: insert the new
+      // bitmap before the old one and start already shifted left by one
+      // plot-width, so the old bitmap — now the second child — sits exactly
+      // where it visually already was; shifting back to 0 then brings the
+      // new bitmap into view from the left. Both insertions happen with
+      // transitions off, so reordering the flex children is never itself
+      // animated — only the deliberate transform change below is.
+      const forward = direction >= 0;
+      if (forward) {
+        track.appendChild(newBitmap);
+      } else {
+        track.insertBefore(newBitmap, oldBitmap);
+        track.style.transform = `translateX(-${width}px)`;
+      }
+
+      // Commit the "before" position, then switch transitions on and move to
+      // the "after" one in a separate style write — the same reflow trick
+      // _onTransitionEnd's callers have always used to keep the two states
+      // from being coalesced into a no-op.
+      void track.offsetWidth;
+      track.style.transition = 'transform 200ms ease';
+      track.style.transform = forward ? `translateX(-${width}px)` : 'translateX(0)';
+
+      await new Promise((resolve) => this._onTransitionEnd(track, resolve));
+    } finally {
+      mask.remove();
+      this._transitioning = false;
+    }
+  }
+
+  // Mode switch (overview <-> day view): a plain opacity crossfade on the
+  // whole chart-anim element, nothing else — the zoom this used to play,
+  // scaled from wherever the day involved sat in the overview, is gone
+  // without replacement.
+  _fadeSwitch(applyState) {
+    const wrap = this.renderRoot && this.renderRoot.querySelector('.chart-anim');
+    if (!wrap) {
+      applyState();
+      return;
+    }
+
+    this._transitioning = true;
+    this._navRebuildPending = true;
+
+    this._onTransitionEnd(wrap, () => {
+      // Rebuild while still fully hidden — the class stays on throughout —
+      // then force a reflow before removing it, so the browser commits that
+      // hidden state as the definite "before" rather than folding the
+      // rebuild and the class removal into a single no-op step that skips
+      // the fade-in transition entirely.
+      applyState();
+      void wrap.offsetWidth;
+      wrap.classList.remove('chart-anim--fade-hidden');
+
+      this._onTransitionEnd(wrap, () => {
+        this._transitioning = false;
+      });
+    });
+
+    wrap.classList.add('chart-anim--fade-hidden');
+  }
+
+  // `transitionend` with a timeout fallback of the same order as the CSS
+  // duration, so a missed event — a property that never actually changed, a
+  // style recalculation that coalesces two transitions, prefers-reduced-motion
+  // disabling the transition after it was already started — cannot leave the
+  // chart stuck mid-switch.
+  _onTransitionEnd(el, callback) {
+    let done = false;
+    const finish = () => {
+      if (done) {
+        return;
+      }
+      done = true;
+      el.removeEventListener('transitionend', onEnd);
+      clearTimeout(timer);
+      callback();
+    };
+    const onEnd = (event) => {
+      if (event.target === el) {
+        finish();
+      }
+    };
+    el.addEventListener('transitionend', onEnd);
+    const timer = setTimeout(finish, 250);
+  }
+
+  _prefersReducedMotion() {
+    return typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
+  }
+
+  // The running hour's value for a forecast-sourced header_extras attribute
+  // (today only precipitation_probability) — independent of mode, the hovered
+  // index or the day currently open. Reuses nowIndex (the same lookup
+  // _renderDetail's "now" check relies on) rather than re-deriving "current
+  // hour" a second way; its 0 fallback for "not found" is guarded against here
+  // by re-checking the hour matches. Generalized from the single hardcoded
+  // probability lookup this used to be so any forecast attribute can reuse it.
+  _currentForecastAttribute(attribute) {
+    const source = this._source();
+    if (!source || !source.length) {
+      return null;
+    }
+
+    const now = new Date();
+    const entry = source[nowIndex(source, now)];
+    if (!entry) {
+      return null;
+    }
+
+    const dt = new Date(entry.datetime);
+    const isCurrentHour = dt.getFullYear() === now.getFullYear()
+      && dt.getMonth() === now.getMonth()
+      && dt.getDate() === now.getDate()
+      && dt.getHours() === now.getHours();
+
+    return isCurrentHour ? entry[attribute] : null;
+  }
+
+  // One header_extras slot's {icon, text}, or null when the value is not
+  // (yet) available — a null slot is left out of the header entirely rather
+  // than rendered empty, see _renderHeader.
+  _headerExtraSlot(extra) {
+    if (extra.entity) {
+      const state = this._hass.states[extra.entity];
+      if (!state || state.state === 'unknown' || state.state === 'unavailable') {
+        return null;
+      }
+
+      const unit = state.attributes.unit_of_measurement;
+      const numeric = Number(state.state);
+      const text = Number.isFinite(numeric)
+        ? `${Math.round(numeric * 10) / 10}${unit ? ` ${unit}` : ''}`
+        : `${state.state}${unit ? ` ${unit}` : ''}`;
+
+      return {
+        icon: extra.icon || state.attributes.icon || HEADER_EXTRA_FALLBACK_ICON,
+        text,
+      };
+    }
+
+    if (!extra.attribute) {
+      return null;
+    }
+
+    const icon = extra.icon || HEADER_EXTRA_DEFAULT_ICONS[extra.attribute] || HEADER_EXTRA_FALLBACK_ICON;
+
+    if (HEADER_EXTRA_FORECAST_ATTRIBUTES.includes(extra.attribute)) {
+      const value = this._currentForecastAttribute(extra.attribute);
+      return value == null ? null : { icon, text: `${Math.round(value)} %` };
+    }
+
+    if (HEADER_EXTRA_ENTITY_ATTRIBUTES.includes(extra.attribute)) {
+      const attrs = this._weather.attributes;
+      const raw = attrs[extra.attribute];
+      if (raw == null) {
+        return null;
+      }
+
+      const value = Math.round(raw);
+      switch (extra.attribute) {
+        case 'humidity':
+          return { icon, text: `${value} %` };
+        case 'wind_speed':
+          return { icon, text: `${value} ${attrs.wind_speed_unit || 'km/h'}` };
+        case 'pressure':
+          return { icon, text: `${value} ${attrs.pressure_unit || 'hPa'}` };
+        case 'apparent_temperature':
+          return { icon, text: `${value}°` };
+        default:
+          return null;
+      }
+    }
+
+    return null;
   }
 
   _renderHeader() {
@@ -424,6 +909,13 @@ class BeautifulWeatherCard extends LitElement {
     const attrs = this._weather.attributes;
     const temp = attrs.temperature;
     const name = this._config.title || attrs.friendly_name || this._config.entity;
+    // Left of the temperature, in configuration order. A slot with no value
+    // right now is skipped entirely — the header's height comes from the icon
+    // and temperature, not from these, so nothing needs a reserved space.
+    const extras = (this._config.header_extras || [])
+      .slice(0, HEADER_EXTRAS_MAX)
+      .map((extra) => this._headerExtraSlot(extra))
+      .filter((slot) => slot != null);
 
     return html`
       <div class="header">
@@ -432,6 +924,12 @@ class BeautifulWeatherCard extends LitElement {
           <div class="name">${name}</div>
           <div class="place">${this._ll(`condition.${this._weather.state}`) || this._weather.state}</div>
         </div>
+        ${extras.map((slot) => html`
+          <div class="header__extra">
+            <ha-icon class="header__extra-icon" .icon=${slot.icon}></ha-icon>
+            <span class="header__extra-value">${slot.text}</span>
+          </div>
+        `)}
         ${temp == null ? nothing : html`<div class="temp">${Math.round(temp)}°</div>`}
       </div>
     `;
@@ -458,42 +956,31 @@ class BeautifulWeatherCard extends LitElement {
     });
   }
 
-  // Only the day view needs controls: step a day back or forward, or return to
-  // the week overview. The overview itself is navigated by tapping the chart.
-  _renderDayNav() {
+  // The compact week band under the day chart — a second chart, not this
+  // element's own click target list, decides which day it highlights; a click
+  // anywhere on it returns to the full overview (see render()'s onClick).
+  // Only present in the day view; the overview is reached from here or the
+  // day-nav arrows now living in the detail row (see _renderDetail).
+  _renderBand(height) {
     if (this._mode !== 'today') {
       return nothing;
     }
 
-    const max = this._maxDayOffset();
-
     return html`
-      <div class="day-nav">
-        <button
-          type="button"
-          class="day-nav__button"
-          title=${this._ll('previousDay')}
-          aria-label=${this._ll('previousDay')}
-          ?disabled=${this._dayOffset <= 0}
-          @click=${() => this._selectDay(this._dayOffset - 1)}
-        ><ha-icon .icon=${'mdi:chevron-left'}></ha-icon></button>
-        <button
-          type="button"
-          class="day-nav__button day-nav__overview"
-          @click=${() => this._showOverview()}
-        >${this._ll('overview')}</button>
-        <button
-          type="button"
-          class="day-nav__button"
-          title=${this._ll('nextDay')}
-          aria-label=${this._ll('nextDay')}
-          ?disabled=${this._dayOffset >= max}
-          @click=${() => this._selectDay(this._dayOffset + 1)}
-        ><ha-icon .icon=${'mdi:chevron-right'}></ha-icon></button>
+      <div
+        class="band-wrap"
+        style="height: ${height}px"
+        title=${this._ll('overview')}
+        @click=${() => this._showOverview()}
+      >
+        <canvas id="band-chart"></canvas>
       </div>
     `;
   }
 
+  // Day-nav arrows now live at the outer edges of the detail row rather than
+  // in a row of their own below the chart — the "Overview" button they used
+  // to flank is gone; the band under the chart (see _renderBand) replaces it.
   _renderDetail(data) {
     if (!this._config.show_detail_row || this._mode !== 'today' || !data) {
       return nothing;
@@ -514,18 +1001,65 @@ class BeautifulWeatherCard extends LitElement {
       minute: '2-digit',
     });
     const precip = entry.precipitation == null ? 0 : entry.precipitation;
+    const probability = entry.precipitation_probability == null
+      ? '–'
+      : `${Math.round(entry.precipitation_probability)} %`;
+    const wind = entry.wind_speed == null
+      ? '–'
+      : `${Math.round(entry.wind_speed)} km/h`;
 
+    // The day currently shown, not the hovered hour — so it stays put while
+    // hovering moves the time/value columns next to it.
+    const dayDate = new Date(data.entries[0].datetime);
+    const dayLabel = dayDate.toLocaleDateString(this._language, {
+      weekday: 'short',
+      day: '2-digit',
+      month: '2-digit',
+    });
+    const max = this._maxDayOffset();
+
+    // Every slot is always rendered — a missing value becomes "–" rather than
+    // disappearing — inside a fixed-column grid (see .detail in styles.js), so
+    // hovering across hours never reflows or resizes the row, and neither do
+    // the arrows changing between enabled/disabled at the range's edges.
     return html`
       <div class="detail">
-        <span class="time">${isNow ? this._ll('now') : time}</span>
-        <span class="item">${this._ll('temperature')} <b>${entry.temperature}°</b></span>
-        <span class="item">${this._ll('precipitation')} <b>${precip.toFixed(1)} mm</b></span>
-        ${entry.precipitation_probability == null
-          ? nothing
-          : html`<span class="item">${this._ll('probability')} <b>${Math.round(entry.precipitation_probability)} %</b></span>`}
-        ${entry.wind_speed == null
-          ? nothing
-          : html`<span class="item">${this._ll('wind')} <b>${Math.round(entry.wind_speed)} km/h</b></span>`}
+        <button
+          type="button"
+          class="detail__nav"
+          title=${this._ll('previousDay')}
+          aria-label=${this._ll('previousDay')}
+          ?disabled=${this._dayOffset <= 0}
+          @click=${() => this._selectDay(this._dayOffset - 1)}
+        ><ha-icon .icon=${'mdi:chevron-left'}></ha-icon></button>
+        <span class="detail__date">
+          <span class="detail__weekday">${dayLabel}</span>
+          <span class="detail__time">${isNow ? this._ll('now') : time}</span>
+        </span>
+        <span class="detail__item" title=${this._ll('temperature')}>
+          <ha-icon class="detail__icon" .icon=${'mdi:thermometer'}></ha-icon>
+          <span class="detail__value">${entry.temperature}°</span>
+        </span>
+        <span class="detail__item" title=${this._ll('precipitation')}>
+          <ha-icon class="detail__icon" .icon=${'mdi:weather-pouring'}></ha-icon>
+          <span class="detail__value">${precip.toFixed(1)} mm</span>
+        </span>
+        <span class="detail__item" title=${this._ll('probability')}>
+          <ha-icon class="detail__icon" .icon=${'mdi:umbrella'}></ha-icon>
+          <span class="detail__value">${probability}</span>
+        </span>
+        <span class="detail__item" title=${this._ll('wind')}>
+          <ha-icon class="detail__icon" .icon=${'mdi:weather-windy'}></ha-icon>
+          <span class="detail__value">${wind}</span>
+        </span>
+        <button
+          type="button"
+          class="detail__nav"
+          title=${this._ll('nextDay')}
+          aria-label=${this._ll('nextDay')}
+          ?disabled=${this._dayOffset >= max}
+          @click=${() => this._selectDay(this._dayOffset + 1)}
+        ><ha-icon .icon=${'mdi:chevron-right'}></ha-icon></button>
       </div>
     `;
   }
@@ -544,15 +1078,20 @@ class BeautifulWeatherCard extends LitElement {
     }
 
     const data = this._data();
-    // The day strip's own height is measured in updated(); while it is showing
-    // (the overview), the chart gives up exactly that much space so both
-    // modes add up to the same total. The nav row below the chart exists only
-    // in the day view, but is deliberately not offset against the strip here —
-    // that would trade one guessed constant for another; only the strip's
-    // real, measured height is worth compensating for.
-    const chartHeight = this._stripHeight > 0
-      ? Math.max(0, this._config.chart_height - this._stripHeight)
+    // Two extra elements share the same height budget as the chart, one per
+    // mode: the day strip (overview only) and the band (day view only). Each
+    // one's own real, measured height is what gets deducted here — a guessed
+    // constant would drift the moment its content (a wrapped label, the
+    // band's rounded target height) changes. Whichever mode is not active has
+    // its measurement pinned at 0 since its element does not exist to measure.
+    const reservedHeight = this._mode === 'trend' ? this._stripHeight : this._bandHeight;
+    const chartHeight = reservedHeight > 0
+      ? Math.max(0, this._config.chart_height - reservedHeight)
       : this._config.chart_height;
+    // Target, not measured: the band's own height request, a fifth of the day
+    // chart's budget. _measureBandHeight() reads back what this actually laid
+    // out to feed the deduction above.
+    const bandHeight = Math.round(this._config.chart_height * BAND_HEIGHT_RATIO);
 
     return html`
       <ha-card>
@@ -563,9 +1102,11 @@ class BeautifulWeatherCard extends LitElement {
           class="chart-wrap ${this._mode === 'trend' ? 'chart-wrap--clickable' : ''}"
           style="height: ${chartHeight}px"
         >
-          <canvas id="chart"></canvas>
+          <div class="chart-anim">
+            <canvas id="chart"></canvas>
+          </div>
         </div>
-        ${this._renderDayNav()}
+        ${this._renderBand(bandHeight)}
       </ha-card>
     `;
   }

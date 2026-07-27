@@ -129,6 +129,9 @@ function crosshairPlugin(getIndex, lineColor) {
 // the day strip above can be padded to the same edges. `afterLayout` rather than
 // `afterRender`: it fires before the first paint and on every resize, and the
 // callback only touches DOM outside the chart, so there is nothing to loop back.
+// Reports the full chartArea rect (left/right/top/bottom) plus the chart's own
+// width/height, so a swipe overlay can be sized against the plot area exactly —
+// left/right/width keep their existing meaning for callers that only used those.
 function layoutReportPlugin(onLayout) {
   return {
     id: 'meteogramLayout',
@@ -137,7 +140,65 @@ function layoutReportPlugin(onLayout) {
       if (!area) {
         return;
       }
-      onLayout({ left: area.left, right: area.right, width: chart.width });
+      onLayout({
+        left: area.left,
+        right: area.right,
+        top: area.top,
+        bottom: area.bottom,
+        width: chart.width,
+        height: chart.height,
+      });
+    },
+  };
+}
+
+// Calendar-day boundaries over the flat entries array, grouped in order of first
+// appearance — the same order `sliceForecast`'s `day_offset` counts in (0 =
+// today). Kept local to chart.js instead of reusing data.js's `groupByDay`
+// because only index ranges are needed here, not the aggregates that helper
+// also computes.
+function dayBoundaries(entries) {
+  const days = [];
+  let lastKey = null;
+
+  entries.forEach((entry, index) => {
+    const date = new Date(entry.datetime);
+    const key = date.getFullYear() + '-' + date.getMonth() + '-' + date.getDate();
+    if (key !== lastKey) {
+      days.push({ startIndex: index, endIndex: index });
+      lastKey = key;
+    } else {
+      days[days.length - 1].endIndex = index;
+    }
+  });
+
+  return days;
+}
+
+// Compact mode's overview band shows which day is currently open in the day view
+// above it — a low-opacity fill over that day's x-range, drawn before the
+// datasets so the curve and bars stay on top.
+function activeDayPlugin(entries, activeDay, fillColor) {
+  return {
+    id: 'meteogramActiveDay',
+    beforeDatasetsDraw(chart) {
+      const day = dayBoundaries(entries)[activeDay];
+      if (!day) {
+        return;
+      }
+
+      const meta = chart.getDatasetMeta(0);
+      const startPoint = meta && meta.data && meta.data[day.startIndex];
+      const endPoint = meta && meta.data && meta.data[day.endIndex];
+      if (!startPoint || !endPoint) {
+        return;
+      }
+
+      const { ctx, chartArea } = chart;
+      ctx.save();
+      ctx.fillStyle = fillColor;
+      ctx.fillRect(startPoint.x, chartArea.top, endPoint.x - startPoint.x, chartArea.bottom - chartArea.top);
+      ctx.restore();
     },
   };
 }
@@ -173,8 +234,10 @@ function xTickCallback(entries, mode, language) {
 // says "this part already happened", the line is a plain hairline, and a single
 // small "Jetzt" names the line instead of labelling both regions. Drawn before
 // the datasets, so nothing of it can ever sit on top of the curve.
-// Does nothing when no measured values are configured.
-function nowDividerPlugin(entries, localize, lineColor, shadeColor) {
+// Does nothing when no measured values are configured. `showLabel` drops just the
+// "now" text for the compact overview band, which keeps the hairline but has no
+// room for a caption.
+function nowDividerPlugin(entries, localize, lineColor, showLabel = true) {
   return {
     id: 'meteogramNowDivider',
     beforeDatasetsDraw(chart) {
@@ -192,17 +255,17 @@ function nowDividerPlugin(entries, localize, lineColor, shadeColor) {
       const { ctx, chartArea } = chart;
       ctx.save();
 
-      ctx.globalAlpha = 0.4;
-      ctx.fillStyle = shadeColor;
-      ctx.fillRect(chartArea.left, chartArea.top, point.x - chartArea.left, chartArea.bottom - chartArea.top);
-
-      ctx.globalAlpha = 0.6;
       ctx.beginPath();
       ctx.moveTo(point.x, chartArea.top);
       ctx.lineTo(point.x, chartArea.bottom);
       ctx.lineWidth = 1;
       ctx.strokeStyle = lineColor;
       ctx.stroke();
+
+      if (!showLabel) {
+        ctx.restore();
+        return;
+      }
 
       ctx.font = '10px system-ui, sans-serif';
       ctx.fillStyle = lineColor;
@@ -221,6 +284,7 @@ function nowDividerPlugin(entries, localize, lineColor, shadeColor) {
 
 export function buildMeteogramChartConfig({
   data, mode, cardConfig, language, localize, onSelect, onLayout, onHover, getActiveIndex,
+  animate = true, compact = false, activeDay = null,
 }) {
   const entries = data.entries;
   const bands = cardConfig.precip_bands || DEFAULT_PRECIP_BANDS;
@@ -251,10 +315,27 @@ export function buildMeteogramChartConfig({
       data: temperatures,
       yAxisID: 'temp',
       order: 0,
-      borderWidth: 2.5,
+      borderWidth: compact ? 1.5 : 2.5,
+      segment: {
+        borderWidth: (ctx) => {
+          if (compact) {
+            return 1.5;
+          }
+          const p0 = entries[ctx.p0DataIndex];
+          const p1 = entries[ctx.p1DataIndex];
+          return (p0 && p1 && p0.measured && p1.measured) ? 1.5 : 2.5;
+        },
+      },
       tension: 0.35,
       pointRadius: 0,
       pointHitRadius: 12,
+      // The hover dot Chart.js normally draws on the active point reads as a
+      // stray mark rather than a highlight — suppressed everywhere, not just in
+      // compact mode. `pointHitRadius` stays untouched: the card's detail row
+      // still needs hover to work.
+      pointHoverRadius: 0,
+      hoverRadius: 0,
+      pointHoverBorderWidth: 0,
       fill: false,
       borderColor: (context) => {
         const { ctx, chartArea, scales } = context.chart;
@@ -283,14 +364,20 @@ export function buildMeteogramChartConfig({
     type: 'bar',
     data: { labels, datasets },
     plugins: [
-      nowDividerPlugin(entries, localize, secondaryColor, gridColor),
+      nowDividerPlugin(entries, localize, secondaryColor, !compact),
       crosshairPlugin(() => (getActiveIndex ? getActiveIndex() : null), secondaryColor),
+      ...(activeDay != null ? [activeDayPlugin(entries, activeDay, gridColor)] : []),
       ...(onLayout ? [layoutReportPlugin(onLayout)] : []),
     ],
     options: {
       responsive: true,
       maintainAspectRatio: false,
-      animation: { duration: 250 },
+      // Off for chart rebuilds triggered by day/mode navigation — main.js already
+      // plays its own slide/zoom transition on the surrounding element for that
+      // case, and Chart.js's own entrance animation (drawing up from the axis) is
+      // exactly the "jumps in from below" the card used to be criticized for. A
+      // plain data refresh (new forecast, same mode/day) still gets the fade.
+      animation: animate ? { duration: 250 } : false,
       interaction: { mode: 'index', intersect: false },
       // `intersect: false` means a tap anywhere in the plot area counts, not just
       // on the curve. In the trend view the card turns that index into a day and
@@ -312,7 +399,9 @@ export function buildMeteogramChartConfig({
         x: {
           stacked: true,
           grid: {
-            display: mode === 'trend',
+            // Compact's overview band keeps the day dividers regardless of mode —
+            // they are the only structure left once ticks/labels are gone.
+            display: compact || mode === 'trend',
             drawTicks: false,
             color: (context) => {
               const entry = entries[context.index];
@@ -324,7 +413,7 @@ export function buildMeteogramChartConfig({
             },
           },
           border: { display: false },
-          ticks: {
+          ticks: compact ? { display: false } : {
             color: secondaryColor,
             maxRotation: 0,
             autoSkip: false,
@@ -334,16 +423,18 @@ export function buildMeteogramChartConfig({
         },
         temp: {
           position: 'left',
-          // Horizontal guides are what make the curve readable at a glance.
+          // Horizontal guides are what make the curve readable at a glance — but
+          // compact's whole point is to show nothing except the curve itself and
+          // the day dividers, so they go along with the ticks there.
           grid: {
-            display: true,
+            display: !compact,
             drawTicks: false,
             color: gridColor,
           },
           border: { display: false, dash: [2, 3] },
           min: tempRange.min,
           max: tempRange.max,
-          ticks: {
+          ticks: compact ? { display: false } : {
             color: secondaryColor,
             font: { size: 11 },
             stepSize: TEMP_AXIS_STEP,
@@ -352,7 +443,9 @@ export function buildMeteogramChartConfig({
         },
         precip: {
           position: 'right',
-          display: mode !== 'trend',
+          // Already hidden in trend mode; compact hides it in day mode too, since
+          // the overview band never shows band labels.
+          display: compact ? false : mode !== 'trend',
           stacked: true,
           min: 0,
           max: precipMax,
@@ -361,7 +454,7 @@ export function buildMeteogramChartConfig({
           afterBuildTicks: (axis) => {
             axis.ticks = visibleBandTicks.map((tick) => ({ value: tick.value }));
           },
-          ticks: {
+          ticks: compact ? { display: false } : {
             color: secondaryColor,
             font: { size: 10 },
             autoSkip: false,
@@ -375,7 +468,7 @@ export function buildMeteogramChartConfig({
       plugins: {
         legend: { display: false },
         tooltip: {
-          enabled: mode === 'trend',
+          enabled: compact ? false : mode === 'trend',
           displayColors: false,
           // `interaction.mode: 'index'` yields one item per dataset — one line plus
           // one per precipitation band. Everything the tooltip shows belongs to the
@@ -417,7 +510,9 @@ export function buildMeteogramChartConfig({
           },
         },
       },
-      layout: { padding: { top: 4, bottom: 0 } },
+      // Compact's band is roughly a fifth of the normal height, so even the
+      // small default padding would eat into it noticeably.
+      layout: { padding: compact ? { top: 1, bottom: 1 } : { top: 4, bottom: 0 } },
       color: textColor,
     },
   };

@@ -11,7 +11,7 @@ Zwei Elemente überlagern sich auf einer gemeinsamen Zeitachse:
 
 | Modus | Zeitraum | Zweck |
 |---|---|---|
-| `today` | ein **Kalendertag** (00:00–24:00 lokal), stündlich | Detailansicht, jeder Stundenwert antippbar |
+| `today` | ein **Kalendertag** (00:00–24:00 lokal), stündlich | Detailansicht, Stundenwerte gehovert für Details |
 | `trend` | **ganze Kalendertage ab heute 00:00**, bis zu 7, stündliche Balken | Temperaturverlauf und Regenzeitpunkte auf einen Blick, keine Detailwerte nötig |
 
 Beide Ansichten zeigen bewusst Kalendertage, kein rollendes Fenster ab der
