@@ -64,18 +64,30 @@ export const cardStyles = css`
   /* One tile per day, each exactly as wide as that day's stretch of the chart
      below. No gaps and no scrolling: the strip is a header for the plot area,
      and its horizontal padding is set from the chart's own layout (see
-     alignDayStrip in day-strip.js). */
+     alignDayStrip in day-strip.js). align-items: stretch (rather than
+     flex-start) gives every tile the same height regardless of how much of
+     its content --tight/--sliver hide, so the day-boundary divider below
+     always runs the full height of the row, not just of that tile's own
+     content. */
   .day-strip {
     display: flex;
-    align-items: flex-start;
+    align-items: stretch;
     gap: 0;
-    padding: 0 0 6px;
+    padding: 0;
     margin: 0;
   }
 
-  /* Tiles carry no chrome at all — no border, no fill. Only their content is
-     visible, the way the app template shows it. */
+  /* Tiles carry no chrome of their own beyond the day-boundary divider — no
+     fill. Only their content (plus that divider) is visible, the way the app
+     template shows it. box-sizing: border-box is what lets the divider below
+     be a border without changing the tile's width: flexbox sizes border-box
+     items by their outer edge, so the 1px border is absorbed from the
+     content box instead of adding to the width alignDayStrip lined up
+     against the chart. The bottom padding carries the 6px gap that used to
+     sit on .day-strip itself, so the divider (and the --active hairline)
+     reach all the way down to the chart instead of stopping short of it. */
   .day-strip__tile {
+    box-sizing: border-box;
     appearance: none;
     flex: 1 1 0;
     min-width: 0;
@@ -83,7 +95,7 @@ export const cardStyles = css`
     flex-direction: column;
     align-items: center;
     gap: 1px;
-    padding: 2px 1px 4px;
+    padding: 2px 1px 10px;
     border: 0;
     border-radius: 0;
     background: none;
@@ -92,6 +104,13 @@ export const cardStyles = css`
     line-height: 1.2;
     overflow: hidden;
     cursor: pointer;
+  }
+
+  /* The day-boundary divider, carried down from the chart's own gridline so a
+     tile and its chart segment read as one column. Skipped on the first
+     tile: there is no previous segment to its left to separate from. */
+  .day-strip__tile:not(:first-child) {
+    border-left: 1px solid var(--divider-color);
   }
 
   .day-strip__tile:focus-visible {
@@ -199,11 +218,14 @@ export const cardStyles = css`
     cursor: pointer;
   }
 
+  /* Sits below the chart now, not above it: top margin is the breathing room
+     against the plot, and there is deliberately no bottom margin — ha-card's
+     own 6px bottom padding is what keeps this flush with the card edge. */
   .day-nav {
     display: flex;
     align-items: stretch;
     gap: 4px;
-    margin: 6px 0 0;
+    margin: 8px 0 0;
   }
 
   .day-nav__button {

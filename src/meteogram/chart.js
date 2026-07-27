@@ -167,13 +167,14 @@ function xTickCallback(entries, mode, language) {
   };
 }
 
-// Separates recorded hours from forecast ones, the way the DWD app does. Does
-// nothing when no measured values are configured, so the chart stays unchanged.
-// `withLabels` is off in the overview: a week's worth of hours leaves the early
-// morning only a few pixels, far too little for the word "Messwerte" to sit
-// beside the line without colliding with it. The shaded area carries the same
-// meaning there.
-function nowDividerPlugin(entries, localize, lineColor, shadeColor, withLabels) {
+// Marks where the recorded hours end and the forecast begins. Three things used
+// to compete here — a shaded block, a thick line and the two words "Messwerte"
+// and "Prognose" flanking it. Now the shading is barely-there tint that only
+// says "this part already happened", the line is a plain hairline, and a single
+// small "Jetzt" names the line instead of labelling both regions. Drawn before
+// the datasets, so nothing of it can ever sit on top of the curve.
+// Does nothing when no measured values are configured.
+function nowDividerPlugin(entries, localize, lineColor, shadeColor) {
   return {
     id: 'meteogramNowDivider',
     beforeDatasetsDraw(chart) {
@@ -191,34 +192,36 @@ function nowDividerPlugin(entries, localize, lineColor, shadeColor, withLabels) 
       const { ctx, chartArea } = chart;
       ctx.save();
 
-      ctx.globalAlpha = 0.35;
+      ctx.globalAlpha = 0.4;
       ctx.fillStyle = shadeColor;
       ctx.fillRect(chartArea.left, chartArea.top, point.x - chartArea.left, chartArea.bottom - chartArea.top);
-      ctx.globalAlpha = 1;
 
+      ctx.globalAlpha = 0.6;
       ctx.beginPath();
       ctx.moveTo(point.x, chartArea.top);
       ctx.lineTo(point.x, chartArea.bottom);
-      ctx.lineWidth = 1.5;
+      ctx.lineWidth = 1;
       ctx.strokeStyle = lineColor;
       ctx.stroke();
 
-      if (withLabels) {
-        ctx.font = '11px system-ui, sans-serif';
-        ctx.fillStyle = lineColor;
-        ctx.textBaseline = 'top';
-        ctx.textAlign = 'right';
-        ctx.fillText(localize('measured'), point.x - 6, chartArea.top + 2);
-        ctx.textAlign = 'left';
-        ctx.fillText(localize('forecast'), point.x + 6, chartArea.top + 2);
-      }
+      ctx.font = '10px system-ui, sans-serif';
+      ctx.fillStyle = lineColor;
+      ctx.textBaseline = 'top';
+      // Right of the line where there is room, otherwise left of it — the line
+      // sits at the current hour and can be close to either edge.
+      const label = localize('now');
+      const fits = point.x + ctx.measureText(label).width + 8 < chartArea.right;
+      ctx.textAlign = fits ? 'left' : 'right';
+      ctx.fillText(label, point.x + (fits ? 4 : -4), chartArea.top + 1);
 
       ctx.restore();
     },
   };
 }
 
-export function buildMeteogramChartConfig({ data, mode, cardConfig, language, localize, onSelect, onLayout }) {
+export function buildMeteogramChartConfig({
+  data, mode, cardConfig, language, localize, onSelect, onLayout, onHover, getActiveIndex,
+}) {
   const entries = data.entries;
   const bands = cardConfig.precip_bands || DEFAULT_PRECIP_BANDS;
   const stops = cardConfig.temperature_gradient || DEFAULT_TEMP_STOPS;
@@ -240,8 +243,6 @@ export function buildMeteogramChartConfig({ data, mode, cardConfig, language, lo
   const textColor = cssVar('--primary-text-color', '#212121');
   const secondaryColor = cssVar('--secondary-text-color', '#727272');
   const gridColor = cssVar('--divider-color', 'rgba(127,127,127,0.25)');
-
-  let selectedIndex = null;
 
   const datasets = [
     {
@@ -282,8 +283,8 @@ export function buildMeteogramChartConfig({ data, mode, cardConfig, language, lo
     type: 'bar',
     data: { labels, datasets },
     plugins: [
-      nowDividerPlugin(entries, localize, secondaryColor, gridColor, mode !== 'trend'),
-      crosshairPlugin(() => selectedIndex, secondaryColor),
+      nowDividerPlugin(entries, localize, secondaryColor, gridColor),
+      crosshairPlugin(() => (getActiveIndex ? getActiveIndex() : null), secondaryColor),
       ...(onLayout ? [layoutReportPlugin(onLayout)] : []),
     ],
     options: {
@@ -300,15 +301,13 @@ export function buildMeteogramChartConfig({ data, mode, cardConfig, language, lo
           return;
         }
 
-        if (mode !== 'trend') {
-          selectedIndex = points[0].index;
-          chart.draw();
-        }
-
         if (onSelect) {
           onSelect(points[0].index);
         }
       },
+      ...(onHover ? {
+        onHover: (event, elements) => onHover(elements.length ? elements[0].index : null),
+      } : {}),
       scales: {
         x: {
           stacked: true,
@@ -340,9 +339,8 @@ export function buildMeteogramChartConfig({ data, mode, cardConfig, language, lo
             display: true,
             drawTicks: false,
             color: gridColor,
-            borderDash: [2, 3],
           },
-          border: { display: false },
+          border: { display: false, dash: [2, 3] },
           min: tempRange.min,
           max: tempRange.max,
           ticks: {
@@ -354,6 +352,7 @@ export function buildMeteogramChartConfig({ data, mode, cardConfig, language, lo
         },
         precip: {
           position: 'right',
+          display: mode !== 'trend',
           stacked: true,
           min: 0,
           max: precipMax,
@@ -411,10 +410,6 @@ export function buildMeteogramChartConfig({ data, mode, cardConfig, language, lo
               const precip = precipTotals[item.dataIndex] || 0;
               if (precip > 0) {
                 parts.push(`${localize('precipitation')}: ${precip.toFixed(1)} mm`);
-              }
-
-              if (entry.precipitation_probability != null) {
-                parts.push(`${localize('probability')}: ${Math.round(entry.precipitation_probability)} %`);
               }
 
               return parts;

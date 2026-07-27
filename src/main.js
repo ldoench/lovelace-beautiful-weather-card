@@ -21,6 +21,29 @@ function dayOffsetFrom(date, now = new Date()) {
   return Math.round((to - from) / DAY_MS);
 }
 
+// Index of the entry whose hour is the current one. Entries are hourly and in
+// order, so at most one can match; falls back to the first entry if none does.
+function nowIndex(entries, now = new Date()) {
+  const index = entries.findIndex((entry) => {
+    const dt = new Date(entry.datetime);
+    return dt.getFullYear() === now.getFullYear()
+      && dt.getMonth() === now.getMonth()
+      && dt.getDate() === now.getDate()
+      && dt.getHours() === now.getHours();
+  });
+  return index === -1 ? 0 : index;
+}
+
+// Whether the chart needs rebuilding rather than just redrawing. Hovering
+// changes only which index is highlighted, not the shape of the data — a
+// signature that ignores hover state lets _renderChart tell the two apart and
+// keep the chart alive under the mouse for the second case.
+function chartSignature(mode, dayOffset, visibleDays, entries) {
+  const first = entries.length ? entries[0].datetime : '';
+  const last = entries.length ? entries[entries.length - 1].datetime : '';
+  return [mode, dayOffset, visibleDays, entries.length, first, last].join('|');
+}
+
 class BeautifulWeatherCard extends LitElement {
   static get properties() {
     return {
@@ -29,9 +52,10 @@ class BeautifulWeatherCard extends LitElement {
       _weather: { state: true },
       _mode: { state: true },
       _measured: { state: true },
-      _selectedIndex: { state: true },
+      _hoverIndex: { state: true },
       _dayOffset: { state: true },
       _visibleDays: { state: true },
+      _stripHeight: { state: true },
     };
   }
 
@@ -43,10 +67,12 @@ class BeautifulWeatherCard extends LitElement {
     super();
     this._forecasts = null;
     this._measured = [];
-    this._selectedIndex = null;
+    this._hoverIndex = null;
     this._dayOffset = 0;
     this._visibleDays = MAX_STRIP_DAYS;
+    this._stripHeight = 0;
     this._chart = null;
+    this._chartSignature = null;
     this._forecastUnsub = null;
     this._subscribedEntity = null;
     this._resizeObserver = null;
@@ -163,7 +189,7 @@ class BeautifulWeatherCard extends LitElement {
     this._forecastUnsub = this._hass.connection.subscribeMessage(
       (event) => {
         this._forecasts = event.forecast || [];
-        this._selectedIndex = null;
+        this._hoverIndex = null;
         this._loadMeasured();
       },
       {
@@ -222,15 +248,16 @@ class BeautifulWeatherCard extends LitElement {
   }
 
   // Days for the day strip, independent of the currently displayed mode/offset —
-  // a tap on a tile only changes what the chart shows, not what the strip lists.
-  // Built from the same source and the same day count as the overview, so a tile
-  // and the day below it always describe the same hours.
+  // the strip always spans the same midnight-to-midnight window regardless of
+  // which day happens to be open in the day view. Unlike _source(), this always
+  // merges in the measured hours: they only exist for today, but today is
+  // always part of the strip's window, no matter which day is currently shown.
   _stripDays() {
-    const source = this._source();
-    if (!source) {
+    if (!this._forecasts || !this._forecasts.length) {
       return [];
     }
 
+    const source = mergeMeasured(this._measured || [], this._forecasts);
     const data = computeMeteogramData(source, 'trend', {
       trend_days: this._trendDays(),
       precip_bands: this._config.precip_bands,
@@ -242,6 +269,22 @@ class BeautifulWeatherCard extends LitElement {
   updated(changed) {
     super.updated(changed);
     this._renderChart();
+    this._measureStripHeight();
+  }
+
+  // The day strip's real, current height — not a guessed constant, since its
+  // content (wrapped labels, icon-only tiles at narrow widths) varies with
+  // theme, font and card width. Absent (day view, disabled, or no data), it
+  // measures 0, which render() reads as "give the chart the full height back".
+  // Cached and only reassigned on an actual change so a stable measurement
+  // does not keep re-triggering updates.
+  _measureStripHeight() {
+    const strip = this.renderRoot && this.renderRoot.querySelector('.day-strip');
+    const height = strip ? strip.getBoundingClientRect().height : 0;
+
+    if (height !== this._stripHeight) {
+      this._stripHeight = height;
+    }
   }
 
   _renderChart() {
@@ -249,6 +292,15 @@ class BeautifulWeatherCard extends LitElement {
     const data = this._data();
 
     if (!canvas || !data) {
+      return;
+    }
+
+    const signature = chartSignature(this._mode, this._dayOffset, this._visibleDays, data.entries);
+
+    // Hovering re-renders the card (to move the detail row), which would
+    // otherwise destroy and rebuild the chart out from under the mouse on
+    // every mouse move. Rebuild only when the data actually changed.
+    if (this._chart && signature === this._chartSignature) {
       return;
     }
 
@@ -262,13 +314,16 @@ class BeautifulWeatherCard extends LitElement {
       cardConfig: this._config,
       language: this._language,
       localize: (path, vars) => this._ll(path, vars),
-      onSelect: (index) => this._onSelect(index, data),
+      onSelect: (index) => this._onSelect(index, this._data()),
       // Chart.js knows where the plot area starts only after it has measured its
       // axes; the day strip is padded to those edges from there.
       onLayout: (area) => this._alignDayStrip(area),
+      onHover: (index) => this._onHover(index),
+      getActiveIndex: () => this._activeIndex(),
     });
 
     this._chart = new Chart(canvas.getContext('2d'), config);
+    this._chartSignature = signature;
   }
 
   _alignDayStrip(area) {
@@ -276,11 +331,46 @@ class BeautifulWeatherCard extends LitElement {
     alignDayStrip(strip, area);
   }
 
+  // Index the detail row (and the chart's crosshair) shows: a hover overrides
+  // everything until the pointer leaves the chart; failing that, the current
+  // hour when today's day view is open, otherwise the day's first entry.
+  _displayIndex(data) {
+    if (this._hoverIndex != null) {
+      return this._hoverIndex;
+    }
+    return this._dayOffset === 0 ? nowIndex(data.entries) : 0;
+  }
+
+  // Only the day view has a detail row to line the crosshair up with; the
+  // overview gets no crosshair at all.
+  _activeIndex() {
+    if (this._mode !== 'today') {
+      return null;
+    }
+
+    const data = this._data();
+    return data ? this._displayIndex(data) : null;
+  }
+
+  // Hover only matters in the day view (that is where the detail row and
+  // crosshair live) — ignored in the overview so pointer movement there does
+  // not cause a re-render for nothing.
+  _onHover(index) {
+    if (this._mode !== 'today' || index === this._hoverIndex) {
+      return;
+    }
+
+    this._hoverIndex = index;
+    if (this._chart) {
+      this._chart.draw();
+    }
+  }
+
   // The trend chart doubles as the day picker: a tap on a day's area opens that
-  // day. In the day view the same tap only moves the read-out to that hour.
+  // day. In the day view a tap no longer does anything — hover already drives
+  // the read-out there.
   _onSelect(index, data) {
     if (this._mode !== 'trend') {
-      this._selectedIndex = index;
       return;
     }
 
@@ -311,7 +401,7 @@ class BeautifulWeatherCard extends LitElement {
 
     this._mode = 'today';
     this._dayOffset = target;
-    this._selectedIndex = null;
+    this._hoverIndex = null;
 
     // `_measured` always holds today's recorded hours; whether they belong in the
     // current window is decided in _source(). Refreshed here so a day view opened
@@ -322,7 +412,7 @@ class BeautifulWeatherCard extends LitElement {
   _showOverview() {
     this._mode = 'trend';
     this._dayOffset = 0;
-    this._selectedIndex = null;
+    this._hoverIndex = null;
     this._loadMeasured();
   }
 
@@ -347,8 +437,10 @@ class BeautifulWeatherCard extends LitElement {
     `;
   }
 
+  // Only the overview shows the strip: the day view frees that height for the
+  // chart instead (see render()'s height calculation).
   _renderDayStrip() {
-    if (!this._config.show_day_strip) {
+    if (!this._config.show_day_strip || this._mode !== 'trend') {
       return nothing;
     }
 
@@ -360,7 +452,7 @@ class BeautifulWeatherCard extends LitElement {
     return renderDayStrip({
       days,
       // No tile is the active one while the overview is showing all of them.
-      activeIndex: this._mode === 'today' ? this._dayOffset : null,
+      activeIndex: null,
       language: this._language,
       onSelect: (index) => this._selectDay(index),
     });
@@ -407,13 +499,16 @@ class BeautifulWeatherCard extends LitElement {
       return nothing;
     }
 
-    const index = this._selectedIndex == null ? 0 : this._selectedIndex;
+    const index = this._displayIndex(data);
     const entry = data.entries[index];
 
     if (!entry) {
       return nothing;
     }
 
+    // "Jetzt"/"Now" only when the shown index actually is the current hour of
+    // today's day view — a different day has no "now" to fall back to.
+    const isNow = this._dayOffset === 0 && index === nowIndex(data.entries);
     const time = new Date(entry.datetime).toLocaleTimeString(this._language, {
       hour: '2-digit',
       minute: '2-digit',
@@ -422,7 +517,7 @@ class BeautifulWeatherCard extends LitElement {
 
     return html`
       <div class="detail">
-        <span class="time">${index === 0 && this._selectedIndex == null ? this._ll('now') : time}</span>
+        <span class="time">${isNow ? this._ll('now') : time}</span>
         <span class="item">${this._ll('temperature')} <b>${entry.temperature}°</b></span>
         <span class="item">${this._ll('precipitation')} <b>${precip.toFixed(1)} mm</b></span>
         ${entry.precipitation_probability == null
@@ -449,19 +544,28 @@ class BeautifulWeatherCard extends LitElement {
     }
 
     const data = this._data();
+    // The day strip's own height is measured in updated(); while it is showing
+    // (the overview), the chart gives up exactly that much space so both
+    // modes add up to the same total. The nav row below the chart exists only
+    // in the day view, but is deliberately not offset against the strip here —
+    // that would trade one guessed constant for another; only the strip's
+    // real, measured height is worth compensating for.
+    const chartHeight = this._stripHeight > 0
+      ? Math.max(0, this._config.chart_height - this._stripHeight)
+      : this._config.chart_height;
 
     return html`
       <ha-card>
         ${this._renderHeader()}
         ${this._renderDayStrip()}
-        ${this._renderDayNav()}
         ${this._renderDetail(data)}
         <div
           class="chart-wrap ${this._mode === 'trend' ? 'chart-wrap--clickable' : ''}"
-          style="height: ${this._config.chart_height}px"
+          style="height: ${chartHeight}px"
         >
           <canvas id="chart"></canvas>
         </div>
+        ${this._renderDayNav()}
       </ha-card>
     `;
   }
