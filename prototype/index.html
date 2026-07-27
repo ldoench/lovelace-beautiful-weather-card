@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meteogramm — Prototyp</title>
+<style>
+  :root {
+    --card-background-color: #fff;
+    --primary-text-color: #212121;
+    --secondary-text-color: #727272;
+    --divider-color: rgba(0, 0, 0, 0.12);
+    --page-bg: #f2f4f7;
+  }
+  body.dark {
+    --card-background-color: #1c1c1c;
+    --primary-text-color: #e1e1e1;
+    --secondary-text-color: #9b9b9b;
+    --divider-color: rgba(255, 255, 255, 0.16);
+    --page-bg: #111;
+  }
+  body {
+    margin: 0;
+    padding: 24px;
+    background: var(--page-bg);
+    color: var(--primary-text-color);
+    font-family: Roboto, system-ui, -apple-system, sans-serif;
+  }
+  .controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 20px;
+    align-items: center;
+    margin-bottom: 20px;
+    font-size: 14px;
+  }
+  .controls label { cursor: pointer; }
+  .card {
+    background: var(--card-background-color);
+    border-radius: 12px;
+    padding: 10px 12px 6px;
+    margin-bottom: 20px;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.12);
+    box-sizing: border-box;
+    width: 500px;
+  }
+  /* The stub ha-icon renders a text glyph, so it needs a font size where the
+     real one takes --mdc-icon-size. Prototype-only. */
+  .day-strip__icon {
+    font-size: 17px;
+    line-height: 1;
+  }
+  .card h2 {
+    margin: 0 0 4px;
+    font-size: 15px;
+    font-weight: 500;
+  }
+  .readout {
+    min-height: 18px;
+    margin-bottom: 8px;
+    font-size: 13px;
+    color: var(--secondary-text-color);
+  }
+  .chart { position: relative; height: 260px; }
+  .hint { font-size: 12px; color: var(--secondary-text-color); max-width: 900px; }
+</style>
+</head>
+<body>
+
+<div class="controls">
+  <span>Szenario:</span>
+  <label><input type="radio" name="scenario" value="summer" checked> Sommer</label>
+  <label><input type="radio" name="scenario" value="mild"> Mild</label>
+  <label><input type="radio" name="scenario" value="winter"> Winter (Minusgrade)</label>
+  <label>Kartenbreite <input type="range" id="width" min="200" max="900" step="10" value="500"></label>
+  <span id="fit"></span>
+  <label><input type="checkbox" id="no-history"> Ohne Messwerte (nur Prognose)</label>
+  <label style="margin-left:auto"><input type="checkbox" id="theme"> Dunkles Theme</label>
+</div>
+
+<div class="card">
+  <h2>Tag — 00:00–24:00, stündlich</h2>
+  <div id="today-strip"></div>
+  <div class="readout" id="today-readout">Auf eine Stunde klicken für Detailwerte.</div>
+  <div class="chart"><canvas id="today"></canvas></div>
+</div>
+
+<div class="card">
+  <h2>Übersicht — bis zu 7 Tage, stündliche Balken</h2>
+  <div id="trend-strip"></div>
+  <div class="readout" id="trend-readout">&nbsp;</div>
+  <div class="chart"><canvas id="trend"></canvas></div>
+</div>
+
+<p class="hint">
+  Temperaturkurve: Farbe kodiert den Wert (blau Minusgrade, grün um 0 °C, gelb/orange mild, rot heiß).
+  Niederschlagsbalken: gestapelte Intensitätsbänder, nach oben dunkler. Rechte Achse zeigt die Intensitätsklassen.
+  Die Tageskacheln sitzen genau über dem Bereich ihres Tages im Diagramm; wird die Karte schmaler, zeigen Leiste und
+  Diagramm gemeinsam weniger Tage. Die Übersicht nutzt eine breitere Temperaturachse als die Tagesansicht und
+  wirkt dadurch flacher.
+</p>
+
+<!-- Opened straight from disk, and browsers cache file:// scripts hard.
+     Bump the version after `npx rollup -c rollup.prototype.mjs`. -->
+<script src="bundle.js?v=6"></script>
+</body>
+</html>

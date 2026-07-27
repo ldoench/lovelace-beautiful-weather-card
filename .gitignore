@@ -1,0 +1,6 @@
+/node_modules/
+package-lock.json
+
+# Build output — published as a GitHub release asset, not tracked here.
+/dist/
+/prototype/bundle.js

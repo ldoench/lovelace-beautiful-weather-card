@@ -1,0 +1,35 @@
+{
+  "name": "beautiful-weather-card",
+  "version": "0.1.0",
+  "description": "Home Assistant Lovelace card rendering a DWD-inspired meteogram: colour-coded temperature curve over stacked precipitation intensity bars",
+  "keywords": [
+    "home-assistant",
+    "homeassistant",
+    "hass",
+    "lovelace",
+    "custom-cards",
+    "weather",
+    "meteogram"
+  ],
+  "type": "module",
+  "module": "src/main.js",
+  "repository": "git@github.com:ldoench/lovelace-beautiful-weather-card.git",
+  "author": "Leon Dönch",
+  "license": "MIT",
+  "dependencies": {
+    "chart.js": "^4.4.1",
+    "lit": "^2.8.0"
+  },
+  "devDependencies": {
+    "eslint": "^8.56.0",
+    "rollup": "^4.9.6",
+    "rollup-plugin-node-resolve": "^5.2.0",
+    "rollup-plugin-serve": "^2.0.3"
+  },
+  "scripts": {
+    "start": "rollup -c --watch",
+    "build": "npm run lint && npm run rollup",
+    "lint": "eslint \"src/**/*.js\"",
+    "rollup": "rollup -c"
+  }
+}
