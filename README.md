@@ -26,9 +26,15 @@ Developed against [`FL550/dwd_weather`](https://github.com/FL550/dwd_weather), w
 
 ## Installation
 
-### HACS (custom repository)
+### HACS
 
-1. HACS → Frontend → ⋮ → *Custom repositories*
+1. HACS → *Frontend* → search for **Beautiful Weather Card**
+2. Install, then reload your browser
+
+Not showing up yet? Add it as a custom repository instead — this always
+works, even before (or without) the card being listed in the default store:
+
+1. HACS → *Frontend* → ⋮ → *Custom repositories*
 2. Add `https://github.com/ldoench/lovelace-beautiful-weather-card` with category *Lovelace*
 3. Install **Beautiful Weather Card**, then reload your browser
 
