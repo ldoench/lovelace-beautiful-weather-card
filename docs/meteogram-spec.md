@@ -174,7 +174,7 @@ Die Vorlage zeigt ein graues Band um die Temperaturkurve (Ensemble-Spread). Die 
 
 ## Konfigurationsoptionen
 
-Alle auf oberster Ebene der Kartenkonfiguration (kein `forecast:`-Block — der stammte aus dem Upstream, siehe `docs/decisions.md` E9):
+Alle auf oberster Ebene der Kartenkonfiguration (kein `forecast:`-Block — der stammte aus dem Upstream und entfiel beim Neuschrieb):
 
 | Option | Typ | Default | Bedeutung |
 |---|---|---|---|
@@ -195,14 +195,14 @@ Beispiel:
 
 ```yaml
 type: custom:beautiful-weather-card
-entity: weather.oberhaching
+entity: weather.home
 chart_mode: trend
 trend_days: 7
 ```
 
 ## Datengrundlage
 
-Siehe `CLAUDE.md`, Abschnitt „Datenquelle". Kurz:
+Ausgangspunkt war [`FL550/dwd_weather`](https://github.com/FL550/dwd_weather):
 
 - 216 Stundeneinträge verfügbar (9 Tage) — reicht für `trend_days` bis 9
 - `precipitation` ist bereits mm pro Stunde, keine Umrechnung nötig
