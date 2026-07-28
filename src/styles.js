@@ -422,7 +422,10 @@ export const cardStyles = css`
   .chart-anim {
     width: 100%;
     height: 100%;
-    transition: opacity 180ms ease;
+    /* ease-out: starts at full speed so the switch reads as immediate,
+       instead of the slow-in of a plain ease easing into a change that's
+       already over 120ms later. */
+    transition: opacity 120ms ease-out;
   }
 
   .chart-anim--fade-hidden {

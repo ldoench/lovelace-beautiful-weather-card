@@ -592,9 +592,17 @@ export function buildMeteogramChartConfig({
             color: secondaryColor,
             font: { size: 11 },
             stepSize: TEMP_AXIS_STEP,
+            // Label every 5°-step from one step below the data minimum to one
+            // step above the data maximum — not just steps the data literally
+            // reaches. Anything further out (the extra span `tempBounds` adds
+            // to keep the axis from feeling cramped) stays unlabeled.
             callback: (value) => {
-              if (dataTempMax != null && (value > dataTempMax || value < dataTempMin)) {
-                return '';
+              if (dataTempMax != null) {
+                const labelMin = Math.floor(dataTempMin / TEMP_AXIS_STEP) * TEMP_AXIS_STEP;
+                const labelMax = Math.ceil(dataTempMax / TEMP_AXIS_STEP) * TEMP_AXIS_STEP;
+                if (value < labelMin || value > labelMax) {
+                  return '';
+                }
               }
               return `${Math.round(value)}°`;
             },

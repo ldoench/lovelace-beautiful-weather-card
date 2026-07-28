@@ -22,6 +22,19 @@ Chart.register(...registerables);
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+// Mode switch (overview <-> day view) crossfade — see .chart-anim in
+// styles.js, which must be kept in sync with this value.
+const FADE_SWITCH_MS = 120;
+
+// Day-to-day swipe — see the inline `transform` transition in _slideSwitch
+// below, which is the only place this duration is applied as CSS.
+const SLIDE_SWITCH_MS = 160;
+
+// Headroom added on top of a transition's own duration before its
+// `_onTransitionEnd` fallback fires, to absorb scheduling jitter without
+// meaningfully outliving the transition it backs up.
+const TRANSITION_TIMEOUT_BUFFER_MS = 60;
+
 // The band under the day chart mirrors the overview, scaled down to a fraction
 // of the day chart's own configured height. Lowered from 0.2 after real-data
 // feedback that the day chart itself reads too flat — what this gives up goes
@@ -941,10 +954,10 @@ class BeautifulWeatherCard extends LitElement {
       // _onTransitionEnd's callers have always used to keep the two states
       // from being coalesced into a no-op.
       void track.offsetWidth;
-      track.style.transition = 'transform 200ms ease';
+      track.style.transition = `transform ${SLIDE_SWITCH_MS}ms ease`;
       track.style.transform = forward ? `translateX(-${width}px)` : 'translateX(0)';
 
-      await new Promise((resolve) => this._onTransitionEnd(track, resolve));
+      await new Promise((resolve) => this._onTransitionEnd(track, resolve, SLIDE_SWITCH_MS));
     } finally {
       mask.remove();
       this._transitioning = false;
@@ -977,8 +990,8 @@ class BeautifulWeatherCard extends LitElement {
 
       this._onTransitionEnd(wrap, () => {
         this._transitioning = false;
-      });
-    });
+      }, FADE_SWITCH_MS);
+    }, FADE_SWITCH_MS);
 
     wrap.classList.add('chart-anim--fade-hidden');
   }
@@ -987,8 +1000,10 @@ class BeautifulWeatherCard extends LitElement {
   // duration, so a missed event — a property that never actually changed, a
   // style recalculation that coalesces two transitions, prefers-reduced-motion
   // disabling the transition after it was already started — cannot leave the
-  // chart stuck mid-switch.
-  _onTransitionEnd(el, callback) {
+  // chart stuck mid-switch. `durationMs` should match the transition it is
+  // guarding (see FADE_SWITCH_MS / SLIDE_SWITCH_MS) plus headroom, or the
+  // fallback outlives the CSS change it is meant to back up.
+  _onTransitionEnd(el, callback, durationMs = SLIDE_SWITCH_MS) {
     let done = false;
     const finish = () => {
       if (done) {
@@ -1005,7 +1020,7 @@ class BeautifulWeatherCard extends LitElement {
       }
     };
     el.addEventListener('transitionend', onEnd);
-    const timer = setTimeout(finish, 250);
+    const timer = setTimeout(finish, durationMs + TRANSITION_TIMEOUT_BUFFER_MS);
   }
 
   _prefersReducedMotion() {

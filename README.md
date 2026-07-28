@@ -2,13 +2,14 @@
 
 A Home Assistant Lovelace card that renders a **meteogram**: a colour-coded temperature curve layered over stacked precipitation intensity bars. The design is inspired by the charts in the DWD *Warnwetter* app.
 
-![Beautiful Weather Card Meteogram](docs/screenshot-meteogram.png)
+![Overview mode](docs/screenshot-overview.png)
+![Day view](docs/screenshot-day.png)
 
 Two views share the same hourly forecast:
 
 | View | Range | Purpose |
 |---|---|---|
-| **Day** | one calendar day, hour by hour | detailed read-out — tap any hour for its exact values |
+| **Day** | one calendar day, hour by hour, up to 7 days into the past | detailed read-out — hover any hour for its exact values |
 | **Overview** | up to 7 days | temperature trend and when rain is expected, at a glance |
 
 The temperature line is coloured by value — blue below freezing, green around 0 °C, yellow and orange through the mild range, red when it gets hot. Precipitation bars darken as intensity rises, so a heavy hour reads differently from a drizzle even at the same glance.
