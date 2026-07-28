@@ -50,9 +50,9 @@ entity: weather.your_station
 | `chart_mode` | string | `trend` | Initial view: `trend` (week overview) or `today` (single day) |
 | `trend_days` | number | `7` | Upper limit for the days the overview covers (max 7; a narrow card shows fewer) |
 | `trend_bucket_hours` | number | `1` | Hours aggregated per bar in the trend view |
-| `chart_height` | number | `220` | Chart height in pixels |
+| `chart_height` | number | `300` | Pixel budget for the whole card body below the card's edge — header, strips, chart and precipitation band together — so the card is the same height in both modes |
 | `show_current` | boolean | `true` | Header with the current temperature and condition |
-| `show_detail_row` | boolean | `true` | Read-out row for the selected hour |
+| `show_hour_strip` | boolean | `true` | Row of per-hour condition icon and rain probability above the day chart |
 | `show_day_strip` | boolean | `true` | Show day tiles above the chart |
 | `round_temp` | boolean | `false` | Show whole degrees only |
 | `header_extras` | list | `[{ attribute: precipitation_probability }]` | Up to two small values next to the header temperature |
@@ -66,7 +66,12 @@ entity: weather.your_station
 The card opens on the week overview. Tapping a day's area in the chart opens the
 day view for that day; the tiles of the day strip do the same. The day view
 carries a row of three controls — previous day, back to the overview, next day —
-with the arrows disabled at the ends of the available forecast period.
+with the arrows disabled at the ends of the available period.
+
+Forward, that end is the reach of the hourly forecast. Backward, the day view
+can step up to seven days into the past, entirely from recorded values — but
+only if the `history:` sensors below are configured; without them there is no
+source for past days and the previous-day arrow stays disabled at today.
 
 ### The day strip
 
@@ -97,12 +102,14 @@ header_extras:
 
 Each entry sets exactly one of `attribute` or `entity`. `attribute` accepts `precipitation_probability` (read off the hourly forecast) or `humidity`, `wind_speed`, `pressure`, `apparent_temperature` (read off the weather entity's own attributes). Default is a single `precipitation_probability` entry; set `header_extras: []` to show none.
 
-### Measured values for the current day
+### Measured values for past hours and days
 
 Both views start at midnight of their first day, and the forecast only reaches
 forward — so without this the hours of today that already passed stay empty in
-the day view and at the left edge of the overview. Point the card at the sensor
-entities of your station and those hours are filled from the recorder:
+the day view and at the left edge of the overview, and the day view has no way
+to show days before today at all. Point the card at the sensor entities of
+your station and those hours — up to seven days back in the day view — are
+filled from the recorder instead:
 
 ```yaml
 type: custom:beautiful-weather-card

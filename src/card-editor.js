@@ -1,9 +1,5 @@
 import { LitElement, html, css, nothing } from 'lit';
-import {
-  DEFAULT_CONFIG,
-  HEADER_EXTRA_ATTRIBUTES,
-  HEADER_EXTRAS_MAX,
-} from './const.js';
+import { DEFAULT_CONFIG, HEADER_EXTRAS_MAX } from './const.js';
 
 // Labels for the ha-form schema below. HA editors are conventionally English-only
 // regardless of the dashboard language, matching most third-party cards.
@@ -15,35 +11,25 @@ const LABELS = {
   trend_bucket_hours: 'Trend bucket hours',
   chart_height: 'Chart height (px)',
   show_current: 'Show current conditions header',
-  show_detail_row: 'Show detail row',
+  show_hour_strip: 'Show hour strip',
   show_day_strip: 'Show day strip',
   round_temp: 'Round temperatures',
   locale: 'Language',
-};
-
-// Labels for the header-extras attribute picker. Order matches
-// HEADER_EXTRA_ATTRIBUTES (forecast attribute first, then entity attributes).
-const HEADER_EXTRA_ATTRIBUTE_LABELS = {
-  precipitation_probability: 'Precipitation probability (hourly forecast)',
-  humidity: 'Humidity (weather entity attribute)',
-  wind_speed: 'Wind speed (weather entity attribute)',
-  pressure: 'Pressure (weather entity attribute)',
-  apparent_temperature: 'Apparent temperature (weather entity attribute)',
 };
 
 function computeLabel(schema) {
   return LABELS[schema.name] || schema.name;
 }
 
-// Flat, top-level options only. `history.temperature` / `history.precipitation`
-// and `header_extras` are handled by hand-written fields below the form (see
-// render()) — the first needs a different entity domain filter than `entity`,
-// the second is a small array of `{ attribute | entity, icon }` objects, and
-// nesting either into this schema would require ha-form's object-selector,
-// which has no sensible widget. `temperature_gradient` and `precip_bands` are
-// deliberately left out entirely: both are arrays of nested `{ ... , color }`
-// objects, and there is no usable HA form widget for editing nested lists
-// like that — they stay YAML-only.
+// Flat, top-level options only. `history.*` and `header_extras` are handled by
+// hand-written fields below the form (see render()) — the first needs a
+// different entity domain filter than `entity` and lives inside a collapsed
+// section, the second is a small array of `{ attribute | entity }` objects,
+// and nesting either into this schema would require ha-form's object
+// selector, which has no sensible widget. `temperature_gradient` and
+// `precip_bands` are deliberately left out entirely: both are arrays of
+// nested `{ ... , color }` objects, and there is no usable HA form widget for
+// editing nested lists like that — they stay YAML-only.
 const SCHEMA = [
   { name: 'entity', required: true, selector: { entity: { domain: 'weather' } } },
   { name: 'title', selector: { text: {} } },
@@ -65,7 +51,7 @@ const SCHEMA = [
   { name: 'trend_bucket_hours', selector: { number: { min: 1, max: 24, mode: 'box' } } },
   { name: 'chart_height', selector: { number: { min: 100, max: 600, step: 10, mode: 'box' } } },
   { name: 'show_current', selector: { boolean: {} } },
-  { name: 'show_detail_row', selector: { boolean: {} } },
+  { name: 'show_hour_strip', selector: { boolean: {} } },
   { name: 'show_day_strip', selector: { boolean: {} } },
   { name: 'round_temp', selector: { boolean: {} } },
   {
@@ -82,6 +68,36 @@ const SCHEMA = [
     },
   },
 ];
+
+// Sensor keys history.* accepts, and the heuristics used to spot a matching
+// sensor of the same provider for each. Order matches the fields rendered in
+// the "measured values" section. Kept close to LABELS below rather than in
+// const.js: this is editor-only guesswork, main.js never needs it.
+const HISTORY_FIELDS = [
+  { key: 'temperature', label: 'Temperature history sensor' },
+  { key: 'precipitation', label: 'Precipitation history sensor' },
+  { key: 'precipitation_probability', label: 'Precipitation probability history sensor' },
+];
+
+// Matches a HA state object against a history.* key by device_class/unit/name.
+// Best-effort only — a suggestion is offered, never written without the user
+// clicking it, so a wrong guess costs nothing.
+const HISTORY_MATCHERS = {
+  temperature: (state) => state.attributes.device_class === 'temperature',
+  precipitation: (state) => ['precipitation_intensity', 'precipitation'].includes(state.attributes.device_class),
+  precipitation_probability: (state) => {
+    // Providers rarely set a device_class for a plain "% chance" sensor, so
+    // lean on the unit plus a name hint instead — otherwise this collides
+    // with humidity, which is also '%'.
+    if (state.attributes.device_class) {
+      return false;
+    }
+    if (state.attributes.unit_of_measurement !== '%') {
+      return false;
+    }
+    return /precip|niederschlag|rain|regen/i.test(`${state.entity_id} ${state.attributes.friendly_name || ''}`);
+  },
+};
 
 class BeautifulWeatherCardEditor extends LitElement {
   static get properties() {
@@ -106,6 +122,16 @@ class BeautifulWeatherCardEditor extends LitElement {
         gap: 16px;
       }
 
+      .history-fields {
+        padding: 8px 0 0;
+      }
+
+      .history-field {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+
       .history-hint {
         font-size: 12px;
         color: var(--secondary-text-color);
@@ -115,7 +141,7 @@ class BeautifulWeatherCardEditor extends LitElement {
       .header-extra-slot {
         display: flex;
         flex-direction: column;
-        gap: 16px;
+        gap: 8px;
         padding: 8px 0;
         border-top: 1px solid var(--divider-color);
       }
@@ -123,6 +149,44 @@ class BeautifulWeatherCardEditor extends LitElement {
       .header-extra-slot:first-of-type {
         border-top: none;
         padding-top: 0;
+      }
+
+      .entity-chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+
+      .entity-chip {
+        font: inherit;
+        font-size: 12px;
+        line-height: 1;
+        padding: 6px 10px;
+        border-radius: 999px;
+        border: 1px solid var(--divider-color);
+        background: var(--card-background-color, transparent);
+        color: var(--primary-text-color);
+        cursor: pointer;
+      }
+
+      .entity-chip:hover {
+        border-color: var(--primary-color);
+      }
+
+      .entity-chip--active {
+        border-color: var(--primary-color);
+        color: var(--primary-color);
+      }
+
+      .suggestion-row {
+        align-self: flex-start;
+        background: none;
+        border: none;
+        padding: 0;
+        font-size: 12px;
+        color: var(--primary-color);
+        text-decoration: underline;
+        cursor: pointer;
       }
     `;
   }
@@ -143,9 +207,60 @@ class BeautifulWeatherCardEditor extends LitElement {
     this._updateConfig({ ...ev.detail.value });
   }
 
-  _historyEntityChanged(key, ev) {
-    ev.stopPropagation();
-    const entityId = ev.detail.value;
+  // The weather entity's registry entry, giving us platform + device_id to
+  // find its sibling sensors. `hass.entities` is missing on older HA cores —
+  // every caller of this treats null as "no suggestions", never an error.
+  get _weatherEntityMeta() {
+    const entities = this.hass && this.hass.entities;
+    const weatherEntityId = this._config && this._config.entity;
+    if (!entities || !weatherEntityId) {
+      return null;
+    }
+    return entities[weatherEntityId] || null;
+  }
+
+  // Sensor entities belonging to the same device as the weather entity, or —
+  // if it has no device — the same integration. Empty array (not an error)
+  // when hass.entities is unavailable or the weather entity isn't known yet.
+  get _providerSensors() {
+    const meta = this._weatherEntityMeta;
+    const entities = this.hass && this.hass.entities;
+    if (!meta || !entities) {
+      return [];
+    }
+    return Object.values(entities).filter((entry) => {
+      if (!entry.entity_id.startsWith('sensor.')) {
+        return false;
+      }
+      if (meta.device_id) {
+        return entry.device_id === meta.device_id;
+      }
+      return entry.platform === meta.platform;
+    });
+  }
+
+  _entityLabel(entityId) {
+    const state = this.hass && this.hass.states && this.hass.states[entityId];
+    return (state && state.attributes.friendly_name) || entityId;
+  }
+
+  // Best-effort match among the provider's sibling sensors for a history.*
+  // key — null when there are no siblings or none look right.
+  _suggestHistoryEntity(key) {
+    const matcher = HISTORY_MATCHERS[key];
+    if (!matcher || !this.hass || !this.hass.states) {
+      return null;
+    }
+    for (const entry of this._providerSensors) {
+      const state = this.hass.states[entry.entity_id];
+      if (state && matcher(state)) {
+        return state.entity_id;
+      }
+    }
+    return null;
+  }
+
+  _setHistoryEntity(key, entityId) {
     const history = { ...(this._config.history || {}) };
 
     if (entityId) {
@@ -163,48 +278,15 @@ class BeautifulWeatherCardEditor extends LitElement {
     this._fireConfigChanged();
   }
 
+  _historyEntityChanged(key, ev) {
+    ev.stopPropagation();
+    this._setHistoryEntity(key, ev.detail.value);
+  }
+
   // header_extras as currently configured, falling back to the default so a
   // freshly-added card shows its one default slot instead of two empty ones.
   get _headerExtras() {
     return this._config.header_extras || DEFAULT_CONFIG.header_extras;
-  }
-
-  _headerExtraSourceChanged(index, ev) {
-    ev.stopPropagation();
-    const value = ev.detail.value;
-    const current = this._headerExtras[index] || {};
-
-    if (!value) {
-      this._setHeaderExtra(index, null);
-    } else if (value === '__entity__') {
-      this._setHeaderExtra(index, { entity: current.entity || '', ...(current.icon ? { icon: current.icon } : {}) });
-    } else {
-      this._setHeaderExtra(index, { attribute: value, ...(current.icon ? { icon: current.icon } : {}) });
-    }
-  }
-
-  _headerExtraEntityChanged(index, ev) {
-    ev.stopPropagation();
-    const current = this._headerExtras[index] || {};
-    this._setHeaderExtra(index, {
-      entity: ev.detail.value || '',
-      ...(current.icon ? { icon: current.icon } : {}),
-    });
-  }
-
-  _headerExtraIconChanged(index, ev) {
-    ev.stopPropagation();
-    const current = this._headerExtras[index] || {};
-    if (!current.attribute && !current.entity) {
-      return;
-    }
-    const next = { ...current };
-    if (ev.detail.value) {
-      next.icon = ev.detail.value;
-    } else {
-      delete next.icon;
-    }
-    this._setHeaderExtra(index, next);
   }
 
   // Writes one slot back into the array, drops trailing empty slots, and
@@ -229,6 +311,105 @@ class BeautifulWeatherCardEditor extends LitElement {
     this._fireConfigChanged();
   }
 
+  // Sets a slot to a specific entity, keeping its icon if YAML set one (the
+  // editor never offers an icon picker, but shouldn't drop one it finds).
+  _selectHeaderExtraEntity(index, entityId) {
+    const current = this._headerExtras[index] || {};
+    this._setHeaderExtra(index, {
+      entity: entityId,
+      ...(current.icon ? { icon: current.icon } : {}),
+    });
+  }
+
+  _headerExtraEntityChanged(index, ev) {
+    ev.stopPropagation();
+    const value = ev.detail.value || '';
+    const current = this._headerExtras[index] || {};
+    const previousEntity = current.entity || '';
+
+    // A slot configured via `attribute` shows this picker empty; guard
+    // against a no-op event clobbering that attribute when nothing actually
+    // changed (some pickers fire on blur even without an edit).
+    if (value === previousEntity) {
+      return;
+    }
+
+    if (!value) {
+      this._setHeaderExtra(index, null);
+    } else {
+      this._selectHeaderExtraEntity(index, value);
+    }
+  }
+
+  // One slot: sibling sensors of the weather provider as quick-pick chips
+  // (when discoverable), then a free entity picker. A slot set via
+  // `attribute`/`icon` in YAML shows the picker empty and stays that way
+  // until the user picks something here — see _headerExtraEntityChanged.
+  _renderHeaderExtraSlot(index) {
+    const extra = this._headerExtras[index] || {};
+    const entityValue = extra.entity || '';
+    const siblings = this._providerSensors;
+
+    return html`
+      <div class="header-extra-slot">
+        ${siblings.length
+          ? html`
+              <div class="entity-chips">
+                ${siblings.map((entry) => html`
+                  <button
+                    type="button"
+                    class="entity-chip ${entry.entity_id === entityValue ? 'entity-chip--active' : ''}"
+                    @click=${() => this._selectHeaderExtraEntity(index, entry.entity_id)}
+                  >${this._entityLabel(entry.entity_id)}</button>
+                `)}
+              </div>
+            `
+          : nothing}
+        <ha-entity-picker
+          .hass=${this.hass}
+          .value=${entityValue}
+          .label=${`Extra value ${index + 1}`}
+          .includeDomains=${['sensor']}
+          allow-custom-entity
+          @value-changed=${(ev) => this._headerExtraEntityChanged(index, ev)}
+        ></ha-entity-picker>
+      </div>
+    `;
+  }
+
+  // One history.* field: the picker (with the suggestion as placeholder, so
+  // it's visible without being written), plus a clickable row to apply that
+  // suggestion when the field doesn't already hold it.
+  _renderHistoryField(key, label) {
+    const history = this._config.history || {};
+    const value = history[key] || '';
+    const suggestion = this._suggestHistoryEntity(key);
+    const showSuggestion = suggestion && suggestion !== value;
+
+    return html`
+      <div class="history-field">
+        <ha-entity-picker
+          .hass=${this.hass}
+          .value=${value}
+          .label=${label}
+          .placeholder=${suggestion || ''}
+          .includeDomains=${['sensor']}
+          allow-custom-entity
+          @value-changed=${(ev) => this._historyEntityChanged(key, ev)}
+        ></ha-entity-picker>
+        ${showSuggestion
+          ? html`
+              <button
+                type="button"
+                class="suggestion-row"
+                @click=${() => this._setHistoryEntity(key, suggestion)}
+              >Use suggestion: ${this._entityLabel(suggestion)}</button>
+            `
+          : nothing}
+      </div>
+    `;
+  }
+
   _updateConfig(value) {
     this._config = { ...this._config, ...value };
     this._fireConfigChanged();
@@ -243,68 +424,10 @@ class BeautifulWeatherCardEditor extends LitElement {
     this.dispatchEvent(event);
   }
 
-  // One slot renders as a source picker (attribute or custom entity), plus an
-  // entity picker and/or icon picker once a source is chosen.
-  _renderHeaderExtraSlot(index) {
-    const extra = this._headerExtras[index] || {};
-    const sourceValue = extra.entity !== undefined ? '__entity__' : (extra.attribute || '');
-
-    return html`
-      <div class="header-extra-slot">
-        <ha-selector
-          .hass=${this.hass}
-          .selector=${{
-            select: {
-              mode: 'dropdown',
-              options: [
-                { value: '', label: `Extra value ${index + 1}: none` },
-                ...HEADER_EXTRA_ATTRIBUTES.map((attribute) => ({
-                  value: attribute,
-                  label: HEADER_EXTRA_ATTRIBUTE_LABELS[attribute],
-                })),
-                { value: '__entity__', label: 'Custom sensor entity…' },
-              ],
-            },
-          }}
-          .value=${sourceValue}
-          .label=${`Extra value ${index + 1}`}
-          @value-changed=${(ev) => this._headerExtraSourceChanged(index, ev)}
-        ></ha-selector>
-
-        ${sourceValue === '__entity__'
-          ? html`
-              <ha-entity-picker
-                .hass=${this.hass}
-                .value=${extra.entity || ''}
-                .label=${'Sensor entity'}
-                .includeDomains=${['sensor']}
-                allow-custom-entity
-                @value-changed=${(ev) => this._headerExtraEntityChanged(index, ev)}
-              ></ha-entity-picker>
-            `
-          : nothing}
-
-        ${sourceValue
-          ? html`
-              <ha-selector
-                .hass=${this.hass}
-                .selector=${{ icon: {} }}
-                .value=${extra.icon || ''}
-                .label=${'Icon (optional)'}
-                @value-changed=${(ev) => this._headerExtraIconChanged(index, ev)}
-              ></ha-selector>
-            `
-          : nothing}
-      </div>
-    `;
-  }
-
   render() {
     if (!this.hass || !this._config) {
       return nothing;
     }
-
-    const history = this._config.history || {};
 
     return html`
       <ha-form
@@ -322,36 +445,16 @@ class BeautifulWeatherCardEditor extends LitElement {
         ${[0, 1].map((index) => this._renderHeaderExtraSlot(index))}
       </div>
 
-      <div class="history-fields">
-        <p class="history-hint">
-          Optional: sensors that supply recorded values for hours of the current
-          day that already passed (the forecast only reaches forward).
-        </p>
-        <ha-entity-picker
-          .hass=${this.hass}
-          .value=${history.temperature || ''}
-          .label=${'Temperature history sensor'}
-          .includeDomains=${['sensor']}
-          allow-custom-entity
-          @value-changed=${(ev) => this._historyEntityChanged('temperature', ev)}
-        ></ha-entity-picker>
-        <ha-entity-picker
-          .hass=${this.hass}
-          .value=${history.precipitation || ''}
-          .label=${'Precipitation history sensor'}
-          .includeDomains=${['sensor']}
-          allow-custom-entity
-          @value-changed=${(ev) => this._historyEntityChanged('precipitation', ev)}
-        ></ha-entity-picker>
-        <ha-entity-picker
-          .hass=${this.hass}
-          .value=${history.precipitation_probability || ''}
-          .label=${'Precipitation probability history sensor'}
-          .includeDomains=${['sensor']}
-          allow-custom-entity
-          @value-changed=${(ev) => this._historyEntityChanged('precipitation_probability', ev)}
-        ></ha-entity-picker>
-      </div>
+      <ha-expansion-panel .header=${'Measured values (optional)'} outlined>
+        <div class="history-fields">
+          <p class="history-hint">
+            Optional: sensors that supply recorded values for hours of the
+            current day that already passed (the forecast only reaches
+            forward).
+          </p>
+          ${HISTORY_FIELDS.map(({ key, label }) => this._renderHistoryField(key, label))}
+        </div>
+      </ha-expansion-panel>
     `;
   }
 }

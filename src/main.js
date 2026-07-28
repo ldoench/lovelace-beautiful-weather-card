@@ -11,9 +11,10 @@ import {
 } from './const.js';
 import { localize } from './locale.js';
 import { computeMeteogramData } from './meteogram/data.js';
-import { buildMeteogramChartConfig } from './meteogram/chart.js';
+import { buildMeteogramChartConfig, nextTempRange } from './meteogram/chart.js';
 import { fetchMeasuredHours, mergeMeasured } from './meteogram/history.js';
 import { MAX_STRIP_DAYS, alignDayStrip, fitDayCount, renderDayStrip } from './day-strip.js';
+import { alignHourStrip, renderHourStrip, renderPctRow } from './hour-strip.js';
 import { cardStyles } from './styles.js';
 import './card-editor.js';
 
@@ -22,8 +23,25 @@ Chart.register(...registerables);
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 // The band under the day chart mirrors the overview, scaled down to a fraction
-// of the day chart's own configured height.
-const BAND_HEIGHT_RATIO = 0.2;
+// of the day chart's own configured height. Lowered from 0.2 after real-data
+// feedback that the day chart itself reads too flat — what this gives up goes
+// straight to the chart, since chartHeight is chart_height minus every other
+// block's measured height (see render()).
+const BAND_HEIGHT_RATIO = 0.14;
+
+// Mirrors TEMP_AXIS_MIN_SPAN.today in meteogram/chart.js, which is not
+// exported — nextTempRange() needs a minimum span to fall back on the same
+// way buildMeteogramChartConfig itself would if left to pick its own default,
+// so this is kept in sync with that constant by hand. Lowered from 15 after
+// real-data feedback that the day view's temperature swing read too flat.
+const DAY_TEMP_MIN_SPAN = 10;
+
+// How many calendar days into the past the day view can page, when history
+// sensors are configured — the past-facing counterpart to how far the
+// forecast reaches forward (see _maxDayOffset). Without `history:` there is
+// no source for a day before today at all, so _minDayOffset() falls back to
+// 0 regardless of this constant.
+const MAX_HISTORY_DAYS = 7;
 
 // Default icon per header_extras attribute, used when a config entry does not
 // set its own `icon`. A custom `entity` slot prefers that entity's own icon
@@ -132,7 +150,11 @@ class BeautifulWeatherCard extends LitElement {
       _hoverIndex: { state: true },
       _dayOffset: { state: true },
       _visibleDays: { state: true },
+      _headerHeight: { state: true },
       _stripHeight: { state: true },
+      _dayNavHeight: { state: true },
+      _hourStripHeight: { state: true },
+      _pctRowHeight: { state: true },
       _bandHeight: { state: true },
     };
   }
@@ -148,13 +170,28 @@ class BeautifulWeatherCard extends LitElement {
     this._hoverIndex = null;
     this._dayOffset = 0;
     this._visibleDays = MAX_STRIP_DAYS;
+    this._headerHeight = 0;
     this._stripHeight = 0;
+    this._dayNavHeight = 0;
+    this._hourStripHeight = 0;
+    this._pctRowHeight = 0;
     this._bandHeight = 0;
     // Full plot-area rectangle of the day chart, in CSS pixels, as last
     // reported by buildMeteogramChartConfig's onLayout — kept around so a
     // day-nav swipe knows what to freeze into a bitmap before it rebuilds the
     // chart. Not reactive state: it never drives a render on its own.
     this._lastLayout = null;
+    // Earliest instant `_measured` currently covers, or null before the first
+    // load — lets _loadMeasured tell "already have this range" apart from
+    // "need to fetch further back", so paging through the day view does not
+    // re-fetch the whole history on every step (see _loadMeasured).
+    this._measuredLoadedFrom = null;
+    // Day view's own temperature axis range, carried forward across day-nav
+    // steps by nextTempRange() so the axis mostly stays still while paging —
+    // see _renderChart. Not reactive state: it only feeds the chart builder,
+    // never the template. Discarded on the way back to the overview (see
+    // _showOverview), which always computes its own default range instead.
+    this._dayTempRange = null;
     this._chart = null;
     this._chartSignature = null;
     this._bandChart = null;
@@ -303,31 +340,54 @@ class BeautifulWeatherCard extends LitElement {
     return localize(this._language, path, vars);
   }
 
-  // Both views start at midnight of their first day, so both need the recorded
-  // hours: the day view for today's morning, the overview for the same hours at
-  // the left edge of the week.
+  // Both views need the recorded hours: the overview for this morning's hours
+  // at its left edge, the day view for the same when it is open on today, and
+  // for whole days on their own when paged back before today (see
+  // _bandStartOffset). Only the stretch not already covered is fetched — the
+  // gap between `neededStart` and whatever `_measuredLoadedFrom` already is —
+  // so stepping day-to-day does not re-run a multi-day history query every
+  // time. The running hour changes independently of how far back is loaded,
+  // so today's slice is re-fetched on every call regardless.
   async _loadMeasured() {
     if (!this._hass || !this._config.history) {
       return;
     }
 
     const now = new Date();
-    const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    this._measured = await fetchMeasuredHours(this._hass, this._config.history, start, now);
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const neededStart = new Date(
+      now.getFullYear(), now.getMonth(), now.getDate() + this._bandStartOffset(),
+    );
+
+    if (this._measuredLoadedFrom === null) {
+      this._measured = await fetchMeasuredHours(this._hass, this._config.history, neededStart, now);
+      this._measuredLoadedFrom = neededStart;
+      return;
+    }
+
+    if (neededStart < this._measuredLoadedFrom) {
+      const older = await fetchMeasuredHours(
+        this._hass, this._config.history, neededStart, this._measuredLoadedFrom,
+      );
+      this._measured = mergeMeasured(older, this._measured);
+      this._measuredLoadedFrom = neededStart;
+    }
+
+    const current = await fetchMeasuredHours(this._hass, this._config.history, todayStart, now);
+    this._measured = mergeMeasured(current, this._measured);
   }
 
-  // Recorded hours only exist for today, so they are merged in whenever today is
-  // part of the window — always in the overview, in the day view only at offset 0.
+  // mergeMeasured is a true union over the timestamp now, so folding it in
+  // unconditionally is correct for every window: the overview always slices
+  // from today 00:00 regardless (see _data()'s day_offset), and a day view
+  // opened on a past day has no forecast entries for that day at all — measured
+  // history ends up being its only source, exactly as intended.
   _source() {
     if (!this._forecasts || !this._forecasts.length) {
       return null;
     }
 
-    const showsToday = this._mode === 'trend' || this._dayOffset === 0;
-
-    return showsToday
-      ? mergeMeasured(this._measured || [], this._forecasts)
-      : this._forecasts;
+    return mergeMeasured(this._measured || [], this._forecasts);
   }
 
   _data() {
@@ -348,9 +408,8 @@ class BeautifulWeatherCard extends LitElement {
 
   // Days for the day strip, independent of the currently displayed mode/offset —
   // the strip always spans the same midnight-to-midnight window regardless of
-  // which day happens to be open in the day view. Unlike _source(), this always
-  // merges in the measured hours: they only exist for today, but today is
-  // always part of the strip's window, no matter which day is currently shown.
+  // which day happens to be open in the day view, and that window is always
+  // today onward, so the measured hours it needs are always today's.
   _stripDays() {
     if (!this._forecasts || !this._forecasts.length) {
       return [];
@@ -365,9 +424,10 @@ class BeautifulWeatherCard extends LitElement {
     return data.days;
   }
 
-  // Same shape as the overview mode's own data, independent of the day view
-  // currently open — used for the compact band under the day chart, which
-  // always shows the whole week regardless of which day is selected.
+  // Same shape as the overview mode's own data, but windowed from
+  // _bandStartOffset() rather than always today — used for the compact band
+  // under the day chart, which starts one day before whichever day is open
+  // (or 0 in the overview, where there is no band at all).
   _trendData() {
     if (!this._forecasts || !this._forecasts.length) {
       return null;
@@ -380,6 +440,7 @@ class BeautifulWeatherCard extends LitElement {
       temperature_gradient: this._config.temperature_gradient,
       precip_bands: this._config.precip_bands,
       round_temp: this._config.round_temp,
+      day_offset: this._bandStartOffset(),
     });
   }
 
@@ -387,7 +448,11 @@ class BeautifulWeatherCard extends LitElement {
     super.updated(changed);
     this._renderChart();
     this._renderBandChart();
+    this._measureHeaderHeight();
     this._measureStripHeight();
+    this._measureDayNavHeight();
+    this._measureHourStripHeight();
+    this._measurePctRowHeight();
     this._measureBandHeight();
   }
 
@@ -403,6 +468,55 @@ class BeautifulWeatherCard extends LitElement {
 
     if (height !== this._stripHeight) {
       this._stripHeight = height;
+    }
+  }
+
+  // Mirror of _measureStripHeight for the header: only present in the
+  // overview (see _renderHeader), so it measures 0 in the day view. Its
+  // height looks fixed, but a theme's font size can still change it, so it is
+  // measured rather than assumed, same as every other block in this budget.
+  _measureHeaderHeight() {
+    const header = this.renderRoot && this.renderRoot.querySelector('.header');
+    const height = header ? header.getBoundingClientRect().height : 0;
+
+    if (height !== this._headerHeight) {
+      this._headerHeight = height;
+    }
+  }
+
+  // Mirror of _measureStripHeight for the day-nav row: only present in mode
+  // 'today', where it now stands in for the header (see _renderDayNav and the
+  // block-order note there).
+  _measureDayNavHeight() {
+    const nav = this.renderRoot && this.renderRoot.querySelector('.day-nav');
+    const height = nav ? nav.getBoundingClientRect().height : 0;
+
+    if (height !== this._dayNavHeight) {
+      this._dayNavHeight = height;
+    }
+  }
+
+  // Mirror of _measureStripHeight for the hour strip above the day chart: only
+  // present in mode 'today', so it measures 0 in the overview, same as
+  // _measureStripHeight does for the day strip in the day view.
+  _measureHourStripHeight() {
+    const strip = this.renderRoot && this.renderRoot.querySelector('.hour-strip');
+    const height = strip ? strip.getBoundingClientRect().height : 0;
+
+    if (height !== this._hourStripHeight) {
+      this._hourStripHeight = height;
+    }
+  }
+
+  // Mirror of _measureStripHeight for the percentage row below the day chart:
+  // only present in mode 'today', alongside the hour strip it shares its
+  // thinning decision with (see alignHourStrip in hour-strip.js).
+  _measurePctRowHeight() {
+    const row = this.renderRoot && this.renderRoot.querySelector('.pct-row');
+    const height = row ? row.getBoundingClientRect().height : 0;
+
+    if (height !== this._pctRowHeight) {
+      this._pctRowHeight = height;
     }
   }
 
@@ -423,7 +537,16 @@ class BeautifulWeatherCard extends LitElement {
     const canvas = this.renderRoot && this.renderRoot.querySelector('#chart');
     const data = this._data();
 
+    // No canvas to draw into — either nothing has loaded yet, or render()
+    // swapped it out for the "no data" message because the currently open day
+    // is empty (see the dayEmpty computation there). Either way any previous
+    // chart instance is now pointing at a canvas that is no longer in the DOM.
     if (!canvas || !data) {
+      if (this._chart) {
+        this._chart.destroy();
+        this._chart = null;
+        this._chartSignature = null;
+      }
       return;
     }
 
@@ -447,6 +570,19 @@ class BeautifulWeatherCard extends LitElement {
       this._chart.destroy();
     }
 
+    // The day view keeps its temperature axis mostly still while paging
+    // between days, by folding each day's own known values into the range
+    // remembered from the previous one (see nextTempRange in meteogram/chart.js
+    // and the field comment on _dayTempRange). The overview never carries a
+    // range forward — it always gets its own default from a null tempRange,
+    // same as before this task.
+    let tempRange = null;
+    if (this._mode === 'today') {
+      const known = (data.temperatures || []).filter((value) => value != null);
+      this._dayTempRange = nextTempRange(this._dayTempRange, known, DAY_TEMP_MIN_SPAN);
+      tempRange = this._dayTempRange;
+    }
+
     const config = buildMeteogramChartConfig({
       data,
       mode: this._mode,
@@ -461,6 +597,7 @@ class BeautifulWeatherCard extends LitElement {
       onHover: (index) => this._onHover(index),
       getActiveIndex: () => this._activeIndex(),
       animate,
+      tempRange,
     });
 
     this._chart = new Chart(canvas.getContext('2d'), config);
@@ -511,11 +648,35 @@ class BeautifulWeatherCard extends LitElement {
       language: this._language,
       localize: (path, vars) => this._ll(path, vars),
       compact: true,
-      activeDay: this._dayOffset,
+      // The band's own window can start before today (see _bandStartOffset),
+      // so the open day's index within it is no longer _dayOffset itself but
+      // its position relative to that window's start.
+      activeDay: this._dayOffset - this._bandStartOffset(),
+      onSelect: (index) => this._onBandSelect(index, this._trendData()),
     });
 
     this._bandChart = new Chart(canvas.getContext('2d'), config);
     this._bandChartSignature = signature;
+  }
+
+  // The band's own day picker: tapping the day already open in the day view
+  // above it returns to the full overview (the band's equivalent of clicking
+  // the active day-strip tile), tapping any other day loads it — same
+  // swipe-vs-fade transition rule _selectDay already applies everywhere else
+  // a day gets picked.
+  _onBandSelect(index, data) {
+    const entry = data && data.entries[index];
+    if (!entry) {
+      return;
+    }
+
+    const offset = dayOffsetFrom(new Date(entry.datetime));
+    if (offset === this._dayOffset) {
+      this._showOverview();
+      return;
+    }
+
+    this._selectDay(offset);
   }
 
   _alignDayStrip(area) {
@@ -523,24 +684,37 @@ class BeautifulWeatherCard extends LitElement {
     alignDayStrip(strip, area);
   }
 
+  _alignHourStrip(area) {
+    const strip = this.renderRoot && this.renderRoot.querySelector('.hour-strip');
+    const pctRow = this.renderRoot && this.renderRoot.querySelector('.pct-row');
+    alignHourStrip(strip, pctRow, area);
+  }
+
   _onChartLayout(area) {
     this._lastLayout = area;
     this._alignDayStrip(area);
+    this._alignHourStrip(area);
   }
 
-  // Index the detail row (and the chart's crosshair) shows: a hover overrides
-  // everything until the pointer leaves the chart; failing that, the current
-  // hour when today's day view is open, otherwise the day's first entry.
+  // Index the day view's crosshair falls back to once there is no hover: the
+  // current hour when today's day view is open, otherwise the day's first
+  // entry. Called only when there is no hover already — see _activeIndex,
+  // the only caller.
   _displayIndex(data) {
-    if (this._hoverIndex != null) {
-      return this._hoverIndex;
-    }
     return this._dayOffset === 0 ? nowIndex(data.entries) : 0;
   }
 
-  // Only the day view has a detail row to line the crosshair up with; the
-  // overview gets no crosshair at all.
+  // Index the chart's crosshair highlights, in both modes now: a hover
+  // overrides everything until the pointer leaves the chart. Without a hover,
+  // the day view still rests on a default (the current hour, via
+  // _displayIndex) but the overview does not — it never had a single "current
+  // point" to show at rest, so leaving the chart there clears the crosshair
+  // entirely instead of resting on some default index, same "clean fallback"
+  // shape as the day view's own reset just landing on a different value.
   _activeIndex() {
+    if (this._hoverIndex != null) {
+      return this._hoverIndex;
+    }
     if (this._mode !== 'today') {
       return null;
     }
@@ -549,11 +723,11 @@ class BeautifulWeatherCard extends LitElement {
     return data ? this._displayIndex(data) : null;
   }
 
-  // Hover only matters in the day view (that is where the detail row and
-  // crosshair live) — ignored in the overview so pointer movement there does
-  // not cause a re-render for nothing.
+  // Drives the crosshair in both modes now (see _activeIndex) — only the main
+  // chart wires onHover at all (the compact band under the day chart never
+  // does, see _renderBandChart), so this never fires for that one.
   _onHover(index) {
-    if (this._mode !== 'today' || index === this._hoverIndex) {
+    if (index === this._hoverIndex) {
       return;
     }
 
@@ -590,11 +764,30 @@ class BeautifulWeatherCard extends LitElement {
     return Math.max(0, dayOffsetFrom(new Date(last.datetime)));
   }
 
+  // First calendar day the day view can page back into — the past-facing
+  // counterpart to _maxDayOffset(). Without configured history sensors there
+  // is nothing to show for a day before today, so the left arrow keeps
+  // locking at 0 exactly as it did before this could go negative.
+  _minDayOffset() {
+    return this._config.history ? -MAX_HISTORY_DAYS : 0;
+  }
+
+  // First day the compact band under the day chart covers: one day before
+  // whichever day is currently open, so paging back always surfaces exactly
+  // one more past day there — never clamped tighter than _minDayOffset()
+  // allows. 0 outside the day view, where there is no band to begin with.
+  _bandStartOffset() {
+    if (this._mode !== 'today') {
+      return 0;
+    }
+    return Math.max(this._minDayOffset(), this._dayOffset - 1);
+  }
+
   // Switches to the day view for one specific day, from a day-strip tile, a tap
-  // in the trend chart or a day arrow. Measured (recorder) history only applies
-  // to the current calendar day.
+  // in the trend chart or a day arrow. Measured (recorder) history is what makes
+  // a day before today possible at all — see _minDayOffset().
   _selectDay(offset) {
-    const target = Math.min(Math.max(offset, 0), this._maxDayOffset());
+    const target = Math.min(Math.max(offset, this._minDayOffset()), this._maxDayOffset());
 
     // Already there — day-nav's edge buttons are disabled at the boundary, but a
     // tap that resolves to the day already open (e.g. the same day-strip tile)
@@ -632,6 +825,10 @@ class BeautifulWeatherCard extends LitElement {
       this._mode = 'trend';
       this._dayOffset = 0;
       this._hoverIndex = null;
+      // The remembered day-view axis range has nothing to do with the
+      // overview's own — discarded here so the next day view opened starts
+      // fresh from that day's own values instead of an unrelated leftover.
+      this._dayTempRange = null;
       this._loadMeasured();
     });
   }
@@ -818,7 +1015,7 @@ class BeautifulWeatherCard extends LitElement {
   // The running hour's value for a forecast-sourced header_extras attribute
   // (today only precipitation_probability) — independent of mode, the hovered
   // index or the day currently open. Reuses nowIndex (the same lookup
-  // _renderDetail's "now" check relies on) rather than re-deriving "current
+  // _displayIndex's "now" fallback relies on) rather than re-deriving "current
   // hour" a second way; its 0 fallback for "not found" is guarded against here
   // by re-checking the hour matches. Generalized from the single hardcoded
   // probability lookup this used to be so any forecast attribute can reuse it.
@@ -901,8 +1098,14 @@ class BeautifulWeatherCard extends LitElement {
     return null;
   }
 
+  // Overview-only: current condition, header_extras and the large "now"
+  // temperature all describe the present moment, not whichever day happens
+  // to be open in the day view — paging there would otherwise leave stale
+  // values sitting above a chart for a different day. The day view gets its
+  // own top row instead (see _renderDayNav), which carries no per-moment
+  // value at all.
   _renderHeader() {
-    if (!this._config.show_current || !this._weather) {
+    if (!this._config.show_current || !this._weather || this._mode !== 'trend') {
       return nothing;
     }
 
@@ -956,105 +1159,76 @@ class BeautifulWeatherCard extends LitElement {
     });
   }
 
-  // The compact week band under the day chart — a second chart, not this
-  // element's own click target list, decides which day it highlights; a click
-  // anywhere on it returns to the full overview (see render()'s onClick).
-  // Only present in the day view; the overview is reached from here or the
-  // day-nav arrows now living in the detail row (see _renderDetail).
+  // The compact week band under the day chart — a second chart that doubles
+  // as a day picker: tapping the day already open returns to the overview,
+  // tapping any other day loads it (see _onBandSelect, wired through the
+  // band chart's own onClick, not an element listener here — which day was
+  // tapped now matters). Only present in the day view; the overview is
+  // reached from here or the day-nav arrows (see _renderDayNav).
   _renderBand(height) {
     if (this._mode !== 'today') {
       return nothing;
     }
 
     return html`
-      <div
-        class="band-wrap"
-        style="height: ${height}px"
-        title=${this._ll('overview')}
-        @click=${() => this._showOverview()}
-      >
+      <div class="band-wrap" style="height: ${height}px">
         <canvas id="band-chart"></canvas>
       </div>
     `;
   }
 
-  // Day-nav arrows now live at the outer edges of the detail row rather than
-  // in a row of their own below the chart — the "Overview" button they used
-  // to flank is gone; the band under the chart (see _renderBand) replaces it.
-  _renderDetail(data) {
-    if (!this._config.show_detail_row || this._mode !== 'today' || !data) {
+  // Day navigation row: previous/next arrows plus the weekday/date of the day
+  // currently shown, centered between them (see .day-nav in styles.js for the
+  // fixed-edge-column grid that keeps it genuinely centered). Stands in for
+  // the header at the very top of the day view (see the block-order note on
+  // _renderHeader) rather than sitting below it, since it carries no
+  // per-moment value that a header would otherwise duplicate. Per-hour values
+  // (temperature, precipitation, probability, wind) used to live here too;
+  // they are now a chart tooltip instead (see buildMeteogramChartConfig's
+  // tooltip in meteogram/chart.js), and the hour strip plus the percentage row
+  // around the chart (see _renderHourStrip/_renderPctRow) took over the
+  // per-hour condition/probability read-out.
+  _renderDayNav(data) {
+    if (this._mode !== 'today' || !data) {
       return nothing;
     }
 
-    const index = this._displayIndex(data);
-    const entry = data.entries[index];
-
-    if (!entry) {
-      return nothing;
-    }
-
-    // "Jetzt"/"Now" only when the shown index actually is the current hour of
-    // today's day view — a different day has no "now" to fall back to.
-    const isNow = this._dayOffset === 0 && index === nowIndex(data.entries);
-    const time = new Date(entry.datetime).toLocaleTimeString(this._language, {
-      hour: '2-digit',
-      minute: '2-digit',
-    });
-    const precip = entry.precipitation == null ? 0 : entry.precipitation;
-    const probability = entry.precipitation_probability == null
-      ? '–'
-      : `${Math.round(entry.precipitation_probability)} %`;
-    const wind = entry.wind_speed == null
-      ? '–'
-      : `${Math.round(entry.wind_speed)} km/h`;
-
-    // The day currently shown, not the hovered hour — so it stays put while
-    // hovering moves the time/value columns next to it.
-    const dayDate = new Date(data.entries[0].datetime);
+    // Derived from _dayOffset/now rather than from data.entries[0]: a day the
+    // recorder has nothing for (see _renderChart's dayEmpty) still has to show
+    // its own date and keep the arrows usable, even though entries is empty
+    // there. Hovering does not move anything in this row either way, now that
+    // it carries no per-hour value.
+    const now = new Date();
+    const dayDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() + this._dayOffset);
     const dayLabel = dayDate.toLocaleDateString(this._language, {
       weekday: 'short',
       day: '2-digit',
       month: '2-digit',
     });
+    const min = this._minDayOffset();
     const max = this._maxDayOffset();
+    const overviewLabel = this._ll('overview');
 
-    // Every slot is always rendered — a missing value becomes "–" rather than
-    // disappearing — inside a fixed-column grid (see .detail in styles.js), so
-    // hovering across hours never reflows or resizes the row, and neither do
-    // the arrows changing between enabled/disabled at the range's edges.
     return html`
-      <div class="detail">
+      <div class="day-nav">
         <button
           type="button"
-          class="detail__nav"
+          class="day-nav__arrow"
           title=${this._ll('previousDay')}
           aria-label=${this._ll('previousDay')}
-          ?disabled=${this._dayOffset <= 0}
+          ?disabled=${this._dayOffset <= min}
           @click=${() => this._selectDay(this._dayOffset - 1)}
         ><ha-icon .icon=${'mdi:chevron-left'}></ha-icon></button>
-        <span class="detail__date">
-          <span class="detail__weekday">${dayLabel}</span>
-          <span class="detail__time">${isNow ? this._ll('now') : time}</span>
-        </span>
-        <span class="detail__item" title=${this._ll('temperature')}>
-          <ha-icon class="detail__icon" .icon=${'mdi:thermometer'}></ha-icon>
-          <span class="detail__value">${entry.temperature}°</span>
-        </span>
-        <span class="detail__item" title=${this._ll('precipitation')}>
-          <ha-icon class="detail__icon" .icon=${'mdi:weather-pouring'}></ha-icon>
-          <span class="detail__value">${precip.toFixed(1)} mm</span>
-        </span>
-        <span class="detail__item" title=${this._ll('probability')}>
-          <ha-icon class="detail__icon" .icon=${'mdi:umbrella'}></ha-icon>
-          <span class="detail__value">${probability}</span>
-        </span>
-        <span class="detail__item" title=${this._ll('wind')}>
-          <ha-icon class="detail__icon" .icon=${'mdi:weather-windy'}></ha-icon>
-          <span class="detail__value">${wind}</span>
-        </span>
         <button
           type="button"
-          class="detail__nav"
+          class="day-nav__date"
+          title=${overviewLabel}
+          aria-label=${overviewLabel}
+          @click=${() => this._showOverview()}
+        >${dayLabel}</button>
+        <button
+          type="button"
+          class="day-nav__arrow"
           title=${this._ll('nextDay')}
           aria-label=${this._ll('nextDay')}
           ?disabled=${this._dayOffset >= max}
@@ -1062,6 +1236,32 @@ class BeautifulWeatherCard extends LitElement {
         ><ha-icon .icon=${'mdi:chevron-right'}></ha-icon></button>
       </div>
     `;
+  }
+
+  // The hour strip above the day chart: one column per hour with that hour's
+  // condition icon and hour number, DWD-Warnwetter-style. Only in the day
+  // view, and only when show_hour_strip allows it — same gating shape as
+  // _renderDayStrip's own show_day_strip/mode check. Paired with _renderPctRow
+  // below the chart, which shares this same gate and the same thinning
+  // decision (see alignHourStrip in hour-strip.js).
+  _renderHourStrip(data) {
+    if (!this._config.show_hour_strip || this._mode !== 'today' || !data) {
+      return nothing;
+    }
+
+    return renderHourStrip({ entries: data.entries, language: this._language });
+  }
+
+  // The rain-probability row below the day chart, in the space the x-axis's
+  // own hour labels would otherwise occupy (see the day view's `ticks` in
+  // buildMeteogramChartConfig). Gated the same way as _renderHourStrip, whose
+  // pairing partner this is.
+  _renderPctRow(data) {
+    if (!this._config.show_hour_strip || this._mode !== 'today' || !data) {
+      return nothing;
+    }
+
+    return renderPctRow({ entries: data.entries, language: this._language });
   }
 
   render() {
@@ -1078,16 +1278,27 @@ class BeautifulWeatherCard extends LitElement {
     }
 
     const data = this._data();
-    // Two extra elements share the same height budget as the chart, one per
-    // mode: the day strip (overview only) and the band (day view only). Each
-    // one's own real, measured height is what gets deducted here — a guessed
-    // constant would drift the moment its content (a wrapped label, the
-    // band's rounded target height) changes. Whichever mode is not active has
-    // its measurement pinned at 0 since its element does not exist to measure.
-    const reservedHeight = this._mode === 'trend' ? this._stripHeight : this._bandHeight;
-    const chartHeight = reservedHeight > 0
-      ? Math.max(0, this._config.chart_height - reservedHeight)
-      : this._config.chart_height;
+    // A day the recorder (and, this far out, the forecast) has nothing at all
+    // for — reachable now that the day view can page up to a week into the
+    // past (see _minDayOffset). Rendered as a quiet message in place of the
+    // chart instead of an empty plot with dead axes; day-nav and the band
+    // stay live either way, since both are computed independently of `data`.
+    const dayEmpty = this._mode === 'today' && !!data && data.entries.length === 0;
+    // chart_height is the budget for everything below the card's own padding,
+    // in both modes — not just the chart itself. Every block above and below
+    // the chart in the currently active mode is deducted from it: header plus
+    // day strip in the overview, day-nav plus hour strip plus the percentage
+    // row plus the band in the day view (see the block order in the template
+    // below). Each one's own real, measured height is what gets deducted —
+    // a guessed constant would drift the moment its content (a wrapped label,
+    // a thinned-out strip, a theme's font size) changes, and that includes
+    // the header and day-nav even though their height looks fixed. Whichever
+    // mode is not active has its measurement(s) pinned at 0 since those
+    // elements do not exist to measure.
+    const reservedHeight = this._mode === 'trend'
+      ? this._headerHeight + this._stripHeight
+      : this._dayNavHeight + this._hourStripHeight + this._pctRowHeight + this._bandHeight;
+    const chartHeight = Math.max(0, this._config.chart_height - reservedHeight);
     // Target, not measured: the band's own height request, a fifth of the day
     // chart's budget. _measureBandHeight() reads back what this actually laid
     // out to feed the deduction above.
@@ -1097,15 +1308,19 @@ class BeautifulWeatherCard extends LitElement {
       <ha-card>
         ${this._renderHeader()}
         ${this._renderDayStrip()}
-        ${this._renderDetail(data)}
+        ${this._renderDayNav(data)}
+        ${this._renderHourStrip(data)}
         <div
           class="chart-wrap ${this._mode === 'trend' ? 'chart-wrap--clickable' : ''}"
           style="height: ${chartHeight}px"
         >
           <div class="chart-anim">
-            <canvas id="chart"></canvas>
+            ${dayEmpty
+              ? html`<div class="message">${this._ll('noForecast')}</div>`
+              : html`<canvas id="chart"></canvas>`}
           </div>
         </div>
+        ${this._renderPctRow(data)}
         ${this._renderBand(bandHeight)}
       </ha-card>
     `;

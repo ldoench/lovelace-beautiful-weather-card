@@ -205,34 +205,30 @@ export const cardStyles = css`
     display: none;
   }
 
-  /* Value row between strip and chart: a fixed-column grid instead of the
-     previous wrapping flex row. Every slot is always present (a missing value
-     renders as "–", never as nothing), and the grid tracks are sized by
-     minmax(0, 1fr) or a fixed width rather than by their content, so neither a
-     one-digit/three-digit value nor "Jetzt" vs. a five-character time ever
-     changes a column's width. Combined with a fixed height (not a
-     min-height), that is what keeps the row from jumping or rewrapping on
-     every hover — including the day-nav arrows now living at its outer edges,
-     which flip between enabled and disabled without moving anything next to
-     them. Icons replace spelled-out labels so the row never wraps on narrow
-     cards. */
-  .detail {
+  /* Day navigation row: back/forward arrows in fixed-width edge columns so the
+     weekday/date label between them sits at the row's true horizontal
+     center, not merely between two same-content buttons (which drifted
+     off-center once one arrow's disabled state changed nothing about its
+     width, but real optical centering still depends on both edges matching).
+     Fixed height, nothing else in the row — the four value columns this used
+     to carry (temperature, precipitation, probability, wind) are gone; their
+     per-hour values now live in the chart's own tooltip instead. Sits at the
+     very top of the day view in place of the header (see the block-order
+     note on _renderHeader in main.js), so it only needs the one divider
+     below it, not one on both sides the way it did back when the header sat
+     above it too. */
+  .day-nav {
     display: grid;
-    grid-template-columns: 24px 7.5em repeat(4, minmax(0, 1fr)) 24px;
+    grid-template-columns: 24px 1fr 24px;
     align-items: center;
-    column-gap: 8px;
     height: 26px;
     padding: 0;
     margin-bottom: 4px;
-    border-top: 1px solid var(--divider-color);
     border-bottom: 1px solid var(--divider-color);
     font-variant-numeric: tabular-nums;
-    overflow: hidden;
   }
 
-  /* Day-nav's back/forward arrows, now flanking the detail row instead of
-     sitting in a row of their own below the chart. */
-  .detail__nav {
+  .day-nav__arrow {
     appearance: none;
     display: flex;
     align-items: center;
@@ -245,66 +241,163 @@ export const cardStyles = css`
     cursor: pointer;
   }
 
-  .detail__nav ha-icon {
+  .day-nav__arrow ha-icon {
     --mdc-icon-size: 18px;
   }
 
-  .detail__nav:disabled {
+  .day-nav__arrow:disabled {
     color: var(--secondary-text-color);
     opacity: 0.45;
     cursor: default;
   }
 
-  .detail__nav:focus-visible {
+  .day-nav__arrow:focus-visible {
     outline: 2px solid var(--primary-color);
     outline-offset: -1px;
   }
 
-  /* Weekday + date of the day currently shown, with the hovered hour's time
-     (or "Jetzt") beside it — a quiet spot for that read-out now that it no
-     longer heads the row on its own. */
-  .detail__date {
-    display: flex;
-    align-items: baseline;
-    gap: 6px;
+  /* Weekday + date of the day currently shown, centered in the middle grid
+     track between the two fixed-width arrow columns. A real button (see
+     _renderDayNav in main.js) that returns to the overview — bold rather than
+     accent-colored, so it reads as regular header text rather than a link;
+     that it is clickable comes across through cursor, title/aria-label and
+     the hover below instead of through color. */
+  .day-nav__date {
+    appearance: none;
     min-width: 0;
     overflow: hidden;
-  }
-
-  .detail__weekday {
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    text-align: center;
+    font: inherit;
     font-size: 13px;
-    font-weight: 500;
+    font-weight: 700;
     color: var(--primary-text-color);
     white-space: nowrap;
-    overflow: hidden;
     text-overflow: ellipsis;
+    cursor: pointer;
   }
 
-  .detail__time {
-    font-size: 11px;
-    color: var(--secondary-text-color);
-    white-space: nowrap;
+  .day-nav__date:hover {
+    opacity: 0.7;
   }
 
-  .detail__item {
+  .day-nav__date:focus-visible {
+    outline: 2px solid var(--primary-color);
+    outline-offset: -1px;
+  }
+
+  /* Hour strip: one column per hour of the day chart below, condition icon
+     above the hour number — the DWD app's own per-hour header row. No
+     day-boundary dividers (unlike day-strip, there is only one day here).
+     Icons are colored the same way the day strip's are (see conditionColor in
+     const.js) — real-instance feedback was that neutral icons here read as an
+     inconsistency against the day strip rather than a deliberate restraint.
+     Kept flat/low-height per that same feedback: small icon, small label,
+     barely-there padding, no bottom padding at all so the row sits flush
+     against the chart below it (see also .pct-row and .band-wrap, which give
+     up their own padding/margin the same way). The rain probability that used
+     to sit here now lives in .pct-row below the chart instead, sharing this
+     row's thinning decision (see alignHourStrip in hour-strip.js) so the two
+     rows are always in step. position: relative anchors .hour-strip__end
+     (below), the "24" marker past the last hour column. */
+  .hour-strip {
+    position: relative;
     display: flex;
-    align-items: center;
-    gap: 4px;
-    min-width: 0;
+    align-items: stretch;
+    gap: 0;
+    padding: 2px 0 0;
+    margin: 0;
   }
 
-  .detail__icon {
-    --mdc-icon-size: 16px;
-    color: var(--secondary-text-color);
+  .hour-strip__tile {
+    box-sizing: border-box;
+    flex: 1 1 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1px;
+  }
+
+  .hour-strip__icon {
+    --mdc-icon-size: 13px;
     flex: 0 0 auto;
   }
 
-  .detail__value {
-    font-size: 13px;
-    color: var(--primary-text-color);
+  .hour-strip__label {
+    font-size: 9px;
+    color: var(--secondary-text-color);
     white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* The "24" end-of-day marker: not a flex child (adding one would steal width
+     from the 24 equal-share hour tiles and shift their column alignment with
+     the chart below — see renderHourStrip/alignHourStrip in hour-strip.js),
+     so it is positioned out of flow instead. The 'right' offset is set inline
+     per layout to land flush with the plot area's right edge; 'bottom: 0'
+     lines its baseline up with the hour tiles' own labels, which — now that
+     the row has no bottom padding — sit flush with the row's own bottom edge
+     too. */
+  .hour-strip__end {
+    position: absolute;
+    bottom: 0;
+    font-size: 9px;
+    color: var(--secondary-text-color);
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+    pointer-events: none;
+  }
+
+  /* Too narrow for all 24 columns' content at once: every second (then, if
+     still too tight, every third) column's content is hidden via visibility
+     rather than the tile itself being removed or resized, so the columns
+     stay put and stay aligned with the chart below and with .pct-row's own
+     columns (see alignHourStrip in hour-strip.js). */
+  .hour-strip__tile--thin2,
+  .hour-strip__tile--thin3 {
+    visibility: hidden;
+  }
+
+  /* Percentage row below the day chart, in the space the x-axis's own hour
+     labels would otherwise occupy there (see the day view's ticks option in
+     buildMeteogramChartConfig). Same column geometry as .hour-strip above the
+     chart, aligned and thinned together with it — see alignHourStrip in
+     hour-strip.js — so a column is never left with an icon in one row and
+     nothing lining up with it in the other. */
+  .pct-row {
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    padding: 0;
+    margin: 0;
+  }
+
+  .pct-row__tile {
+    box-sizing: border-box;
+    flex: 1 1 0;
+    min-width: 0;
+    display: flex;
+    justify-content: center;
+  }
+
+  /* 0% sits at its lightest (still legible, not invisible) and 100% at
+     var(--secondary-text-color) itself — never darker, i.e. never as
+     prominent as primary text — by scaling this element's opacity rather
+     than interpolating a color; see probabilityOpacity() in hour-strip.js. */
+  .pct-row__value {
+    font-size: 10px;
+    color: var(--secondary-text-color);
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .pct-row__tile--thin2,
+  .pct-row__tile--thin3 {
+    visibility: hidden;
   }
 
   .chart-wrap {
@@ -368,20 +461,20 @@ export const cardStyles = css`
   }
 
   /* The compact week band under the day chart, replacing the old day-nav row
-     (its arrows now flank .detail instead, its "Overview" button is this
-     whole element). Sits below the chart now, not above it: top margin is the
-     breathing room against the plot, and there is deliberately no bottom
-     margin — ha-card's own 6px bottom padding is what keeps this flush with
-     the card edge. Height comes from render()'s inline style (a fraction of
-     chart_height); position: relative plus that explicit height is what lets
-     Chart.js's responsive option size the canvas inside it. Click handling
-     for "return to overview" is a plain element listener rather than the
-     chart's own onClick, since a tap anywhere on the band should work, not
-     only where the chart resolves a data index. */
+     (its arrows now flank .day-nav instead). Sits below the chart now, not
+     above it: top margin is the breathing room against the plot, and there is
+     deliberately no bottom margin — ha-card's own 6px bottom padding is what
+     keeps this flush with the card edge. Height comes from render()'s inline
+     style (a fraction of chart_height); position: relative plus that
+     explicit height is what lets Chart.js's responsive option size the
+     canvas inside it. Clicking a day loads it, clicking the day already open
+     returns to the overview — both handled by the band chart's own onClick
+     via onSelect (see _onBandSelect in main.js), not by an element listener
+     here, since which day was tapped now matters. */
   .band-wrap {
     position: relative;
     width: 100%;
-    margin: 8px 0 0;
+    margin: 2px 0 0;
     cursor: pointer;
   }
 

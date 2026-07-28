@@ -36,9 +36,13 @@ export const DEFAULT_CONFIG = {
   chart_mode: 'trend',
   trend_days: 7,
   trend_bucket_hours: 1,
-  chart_height: 220,
+  // Budget for the whole card body below the card's own edge — header/date
+  // row, strips, chart and band together — not just the chart, so the card
+  // stays the same height in both modes. Raised from the old chart-only 220
+  // to 300 to keep the plot area from shrinking now that it shares the budget.
+  chart_height: 300,
   show_current: true,
-  show_detail_row: true,
+  show_hour_strip: true,
   show_day_strip: true,
   round_temp: false,
   header_extras: [{ attribute: 'precipitation_probability' }],

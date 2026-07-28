@@ -1,11 +1,21 @@
-// Recorded measurements for the hours of the current day that already passed.
-// The forecast subscription only reaches forward, so without this the day view
-// would start at the current hour instead of at midnight.
+// Recorded measurements for hours the forecast no longer covers: the hours of
+// the current day that already passed, and — for the day view's back
+// navigation — whole days up to a week in the past, for which no forecast
+// exists at all. The forecast subscription only reaches forward, so without
+// this the day view would start at the current hour instead of at midnight,
+// and past days would be empty.
 //
 // The weather entity itself is unsuitable as a source: its temperature lives in an
 // attribute, and querying attribute history is expensive. Dedicated sensor
 // entities are used instead, configured explicitly because their names differ per
 // station.
+
+// How long a value may be carried forward into an hour without a sample of
+// its own (see hourlyValue below). Long enough to bridge the recorder
+// compressing a run of genuinely unchanged states, short enough that a real
+// gap — the sensor unavailable overnight, an offline recorder — reads as
+// "no data" instead of a multi-hour run of an invented, stale value.
+const MAX_CARRY_FORWARD_MS = 2 * 60 * 60 * 1000;
 
 function sampleTime(sample) {
   if (typeof sample.lu === 'number') {
@@ -26,6 +36,9 @@ function sampleValue(sample) {
   return Number.isFinite(value) ? value : null;
 }
 
+// Includes the full date, not just the hour of day, so keys stay unique when
+// `start`/`end` span multiple days — required for the day view's back
+// navigation, which requests up to a week at once.
 function hourKey(date) {
   return new Date(date.getFullYear(), date.getMonth(), date.getDate(), date.getHours()).getTime();
 }
@@ -86,6 +99,9 @@ function hourlyValue(series, hour) {
 
   for (let i = series.parsed.length - 1; i >= 0; i--) {
     if (series.parsed[i].time < hour) {
+      if (hour - series.parsed[i].time > MAX_CARRY_FORWARD_MS) {
+        return null;
+      }
       return series.parsed[i].value;
     }
   }
@@ -163,22 +179,26 @@ export async function fetchMeasuredHours(hass, historyConfig, start, end) {
   return entries;
 }
 
-// Measured hours win over forecast hours for the same timestamp, but only
-// field by field: an hour with no sample for e.g. precipitation must not blank
-// out a forecast value that's otherwise still the best information available
-// (this matters most for the current, still in-progress hour, where both a
-// partial measurement and a forecast exist side by side).
+// Unions measured and forecast hours by timestamp — not an overlay of one onto
+// the other, because neither series alone covers the full range the card can
+// now show: forecasts only reach forward, measured hours (back navigation)
+// only reach into the past, and both exist side by side only for the hours of
+// today that already passed. An hour present in just one series is kept as-is
+// (with `measured` set only for the one that truly is); for an hour present in
+// both, the previous field-by-field rule still applies — measured wins per
+// field, but `null` (no sample) never blanks out an otherwise-usable forecast
+// value. Result is deduplicated by timestamp and sorted ascending.
 export function mergeMeasured(measured, forecasts) {
-  if (!measured.length) {
-    return forecasts;
-  }
+  const byTime = new Map();
 
-  const forecastByTime = new Map((forecasts || []).map((entry) => [Date.parse(entry.datetime), entry]));
-  const measuredTimes = new Set(measured.map((entry) => Date.parse(entry.datetime)));
+  (forecasts || []).forEach((entry) => {
+    byTime.set(Date.parse(entry.datetime), entry);
+  });
 
-  const merged = measured.map((entry) => {
-    const forecastEntry = forecastByTime.get(Date.parse(entry.datetime));
-    return {
+  (measured || []).forEach((entry) => {
+    const key = Date.parse(entry.datetime);
+    const forecastEntry = byTime.get(key);
+    byTime.set(key, {
       ...forecastEntry,
       ...entry,
       temperature: entry.temperature !== null ? entry.temperature : (forecastEntry ? forecastEntry.temperature : null),
@@ -187,10 +207,8 @@ export function mergeMeasured(measured, forecasts) {
         ? entry.precipitation_probability
         : (forecastEntry ? forecastEntry.precipitation_probability : null),
       measured: true,
-    };
+    });
   });
 
-  const future = (forecasts || []).filter((entry) => !measuredTimes.has(Date.parse(entry.datetime)));
-
-  return [...merged, ...future].sort((a, b) => Date.parse(a.datetime) - Date.parse(b.datetime));
+  return Array.from(byTime.values()).sort((a, b) => Date.parse(a.datetime) - Date.parse(b.datetime));
 }

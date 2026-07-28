@@ -1,4 +1,39 @@
-import { DEFAULT_PRECIP_BANDS, DEFAULT_TEMP_STOPS, buildTempGradient, precipBandColor } from './colors.js';
+import { Tooltip } from 'chart.js';
+import { DEFAULT_PRECIP_BANDS, DEFAULT_TEMP_STOPS, buildTempGradient, colorAtTemp, precipBandColor } from './colors.js';
+
+// `interaction: { mode: 'index', intersect: false }` collects every dataset at
+// the hovered index — the temperature line and every stacked precipitation bar
+// — and Chart.js's default 'average' positioner places the tooltip at the mean
+// of their pixel y, which the bars drag toward the bottom. This positioner
+// ignores the bars and follows the temperature point instead, falling back to
+// the raw event position if that point is ever unavailable.
+//
+// It also fixes the alignment: `yAlign: 'bottom'` puts the box's own bottom
+// edge at the point, i.e. the box sits above the curve, flipping to below only
+// when there isn't room above — estimated from the previous frame's own
+// height, since Chart.js resolves this position before it measures the new
+// box, so an exact height isn't available yet. `xAlign` stays centered
+// either way. Whatever the alignment, Chart.js clamps the drawn box to the
+// canvas itself (see `getBackgroundPoint`'s `_limitValue` calls in its
+// source) — it can overhang into the axis label area but can never be cut off
+// at the canvas edge, so there is nothing more to do here for that case.
+Tooltip.positioners.meteogramCurve = function meteogramCurve(items, eventPosition) {
+  if (!items.length) {
+    return eventPosition;
+  }
+
+  const chart = this.chart;
+  const meta = chart.getDatasetMeta(0);
+  const point = meta && meta.data && meta.data[items[0].dataIndex];
+  if (!point) {
+    return eventPosition;
+  }
+
+  const estimatedHeight = (this._size && this._size.height) || 70;
+  const yAlign = (point.y - chart.chartArea.top) < estimatedHeight ? 'top' : 'bottom';
+
+  return { x: point.x, y: point.y, xAlign: 'center', yAlign };
+};
 
 // Both axes snap to a fixed ladder instead of tracking the data continuously, so
 // the chart looks the same from day to day and only changes when a real threshold
@@ -10,7 +45,7 @@ const TEMP_AXIS_STEP = 5;
 // every night's dip. Detail belongs to the day view, which keeps the tight span.
 // Done through the value range rather than the height so the card does not change
 // size when switching between the two.
-const TEMP_AXIS_MIN_SPAN = { today: 15, trend: 28 };
+const TEMP_AXIS_MIN_SPAN = { today: 10, trend: 28 };
 const MAX_BAND_LABELS = 4;
 
 function cssVar(name, fallback) {
@@ -51,35 +86,90 @@ function axisMax(alignedBands) {
 }
 
 // Rounds outward to whole steps and keeps a minimum span, so a calm day with a
-// three-degree swing does not get blown up to fill the whole height.
+// three-degree swing does not get blown up to fill the whole height. The edges
+// stay snug against the data — a step is only added on a side when the data
+// would otherwise sit right on it — and any extra span the minSpan still
+// requires is added below the coldest reading rather than above the hottest
+// one. Growing the top edge on every shortfall was how a 35.6° day ended up
+// with a 45° axis; growing downward instead leaves the ceiling wherever the
+// data actually put it, which is also why the tick callback below has to
+// blank out labels above the real maximum.
 function tempBounds(values, minSpan) {
   if (!values.length) {
     return { min: 0, max: minSpan };
   }
 
-  let min = Math.floor((Math.min(...values) - 1) / TEMP_AXIS_STEP) * TEMP_AXIS_STEP;
-  let max = Math.ceil((Math.max(...values) + 1) / TEMP_AXIS_STEP) * TEMP_AXIS_STEP;
+  const dataMin = Math.min(...values);
+  const dataMax = Math.max(...values);
+
+  let min = Math.floor(dataMin / TEMP_AXIS_STEP) * TEMP_AXIS_STEP;
+  let max = Math.ceil(dataMax / TEMP_AXIS_STEP) * TEMP_AXIS_STEP;
+  if (max - dataMax < 1) {
+    max += TEMP_AXIS_STEP;
+  }
+  if (dataMin - min < 1) {
+    min -= TEMP_AXIS_STEP;
+  }
 
   while (max - min < minSpan) {
-    max += TEMP_AXIS_STEP;
-    if (max - min < minSpan) {
-      min -= TEMP_AXIS_STEP;
-    }
+    min -= TEMP_AXIS_STEP;
   }
 
   return { min, max };
 }
 
+// Keeps the temperature axis still while paging between days: it only moves
+// when the data actually stops fitting, or when the current range has grown
+// needlessly wide (which happens once the data that justified it scrolls
+// away). Without `previous` this is just `tempBounds`. When it does move, the
+// side that was exceeded gets rounded outward by one extra step so the next
+// few days are likely to still fit, instead of jumping again immediately.
+export function nextTempRange(previous, values, minSpan) {
+  if (!previous) {
+    return tempBounds(values, minSpan);
+  }
+
+  if (!values.length) {
+    return previous;
+  }
+
+  const min = Math.min(...values) - 1;
+  const max = Math.max(...values) + 1;
+  const fits = min >= previous.min && max <= previous.max;
+
+  const tight = tempBounds(values, minSpan);
+  const prevSpan = previous.max - previous.min;
+  const tightSpan = tight.max - tight.min;
+  const tooWide = prevSpan - tightSpan > 10;
+
+  if (fits && !tooWide) {
+    return previous;
+  }
+
+  let { min: newMin, max: newMax } = tight;
+  if (newMin < previous.min) {
+    newMin -= TEMP_AXIS_STEP;
+  }
+  if (newMax > previous.max) {
+    newMax += TEMP_AXIS_STEP;
+  }
+
+  return { min: newMin, max: newMax };
+}
+
 // Category labels sit at the middle of their band rather than at the boundaries.
 // Only bands actually visible on the current axis get a label, and at most
-// MAX_BAND_LABELS of those, so the right-hand axis never crowds.
+// MAX_BAND_LABELS of those, so the right-hand axis never crowds. The lowest band
+// never gets a label at all (index > 0) — it sits right against the x-axis, so
+// its text is the widest cost driver for the axis while telling readers the
+// least; dropping it lets the plot area claim that width instead.
 function bandTicks(bands, max, localize) {
   const visible = bands
-    .map((band) => {
+    .map((band, index) => {
       const upper = Number.isFinite(band.to) ? Math.min(band.to, max) : max;
-      return { value: (band.from + upper) / 2, label: band.label };
+      return { value: (band.from + upper) / 2, label: band.label, index };
     })
-    .filter((tick) => tick.value > 0 && tick.value < max);
+    .filter((tick) => tick.index > 0 && tick.value > 0 && tick.value < max);
 
   if (visible.length <= MAX_BAND_LABELS) {
     return visible.map((tick) => ({ ...tick, label: localize(tick.label) || tick.label }));
@@ -97,7 +187,21 @@ function bandTicks(bands, max, localize) {
   return picked.map((tick) => ({ ...tick, label: localize(tick.label) || tick.label }));
 }
 
-function crosshairPlugin(getIndex, lineColor) {
+// Chart.js's own hover point is suppressed everywhere (see pointHoverRadius
+// below) because its grow/fade animation reads as a stray flicker rather than a
+// highlight. This draws a plain, static dot instead — same radius every frame,
+// no animation — colored to match the curve at that index via the temperature
+// gradient logic, with a thin ring in the card background color so it stands
+// out against the line underneath it.
+//
+// Runs in both today and trend mode without any mode check — it only depends
+// on `getActiveIndex`, which is null whenever the caller has no hover to
+// report, so it is the card side (main.js) that decides per mode whether
+// anything is wired up, not this plugin. Kept visually distinct from the
+// "now" divider, which marks the fixed measured/forecast boundary rather than
+// the mouse: the divider is dialed down to 40% opacity, so this stays at full
+// opacity and a touch thicker.
+function crosshairPlugin(getIndex, lineColor, pointColor, ringColor) {
   return {
     id: 'meteogramCrosshair',
     afterDatasetsDraw(chart) {
@@ -117,8 +221,16 @@ function crosshairPlugin(getIndex, lineColor) {
       ctx.beginPath();
       ctx.moveTo(point.x, chartArea.top);
       ctx.lineTo(point.x, chartArea.bottom);
-      ctx.lineWidth = 1;
+      ctx.lineWidth = 1.5;
       ctx.strokeStyle = lineColor;
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.arc(point.x, point.y, 3.5, 0, Math.PI * 2);
+      ctx.fillStyle = typeof pointColor === 'function' ? pointColor(index) : pointColor;
+      ctx.fill();
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = ringColor;
       ctx.stroke();
       ctx.restore();
     },
@@ -175,30 +287,48 @@ function dayBoundaries(entries) {
   return days;
 }
 
-// Compact mode's overview band shows which day is currently open in the day view
-// above it — a low-opacity fill over that day's x-range, drawn before the
-// datasets so the curve and bars stay on top.
-function activeDayPlugin(entries, activeDay, fillColor) {
+// Compact mode's overview band shows which day is currently open in the day
+// view above it. Two earlier attempts were rejected: a stripe under the
+// active day in the accent color read too much like a precipitation bar, and
+// a plain background tint on the active day itself was rejected too. Inverted
+// instead — every *inactive* day gets tinted toward the card background so it
+// recedes, leaving the active day untouched, plus a plain 2px baseline in the
+// neutral text color (not the accent color, so it still can't be mistaken for
+// a precip bar). Drawn in `afterDatasetsDraw` rather than before: the tint has
+// to sit on top of the curve and bars to actually dim them, not be painted
+// over by them.
+function activeDayPlugin(entries, activeDay, baselineColor, overlayColor) {
   return {
     id: 'meteogramActiveDay',
-    beforeDatasetsDraw(chart) {
-      const day = dayBoundaries(entries)[activeDay];
-      if (!day) {
-        return;
-      }
-
+    afterDatasetsDraw(chart) {
+      const days = dayBoundaries(entries);
       const meta = chart.getDatasetMeta(0);
-      const startPoint = meta && meta.data && meta.data[day.startIndex];
-      const endPoint = meta && meta.data && meta.data[day.endIndex];
-      if (!startPoint || !endPoint) {
-        return;
-      }
-
       const { ctx, chartArea } = chart;
-      ctx.save();
-      ctx.fillStyle = fillColor;
-      ctx.fillRect(startPoint.x, chartArea.top, endPoint.x - startPoint.x, chartArea.bottom - chartArea.top);
-      ctx.restore();
+
+      days.forEach((day, index) => {
+        const startPoint = meta && meta.data && meta.data[day.startIndex];
+        const endPoint = meta && meta.data && meta.data[day.endIndex];
+        if (!startPoint || !endPoint) {
+          return;
+        }
+
+        if (index !== activeDay) {
+          ctx.save();
+          ctx.globalAlpha = 0.45;
+          ctx.fillStyle = overlayColor;
+          ctx.fillRect(
+            startPoint.x, chartArea.top,
+            endPoint.x - startPoint.x, chartArea.bottom - chartArea.top,
+          );
+          ctx.restore();
+          return;
+        }
+
+        ctx.save();
+        ctx.fillStyle = baselineColor;
+        ctx.fillRect(startPoint.x, chartArea.bottom - 2, endPoint.x - startPoint.x, 2);
+        ctx.restore();
+      });
     },
   };
 }
@@ -260,7 +390,11 @@ function nowDividerPlugin(entries, localize, lineColor, showLabel = true) {
       ctx.lineTo(point.x, chartArea.bottom);
       ctx.lineWidth = 1;
       ctx.strokeStyle = lineColor;
+      // The line itself is dialed back so it reads as a subtle marker rather
+      // than a hard divider; the "Jetzt" label below stays at full opacity.
+      ctx.globalAlpha = 0.4;
       ctx.stroke();
+      ctx.globalAlpha = 1;
 
       if (!showLabel) {
         ctx.restore();
@@ -284,7 +418,7 @@ function nowDividerPlugin(entries, localize, lineColor, showLabel = true) {
 
 export function buildMeteogramChartConfig({
   data, mode, cardConfig, language, localize, onSelect, onLayout, onHover, getActiveIndex,
-  animate = true, compact = false, activeDay = null,
+  animate = true, compact = false, activeDay = null, tempRange: suppliedTempRange = null,
 }) {
   const entries = data.entries;
   const bands = cardConfig.precip_bands || DEFAULT_PRECIP_BANDS;
@@ -293,6 +427,12 @@ export function buildMeteogramChartConfig({
   const labels = entries.map((entry) => entry.datetime);
   const temperatures = data.temperatures;
   const known = temperatures.filter((value) => value != null);
+  // The axis itself may run a step past the data on either side (see
+  // tempBounds), to keep a visual buffer — but a label out there reads as
+  // "the forecast reaches this high/low," which it doesn't. Kept separately
+  // from tempRange, which is the rounded axis range, not the raw data extent.
+  const dataTempMin = known.length ? Math.min(...known) : null;
+  const dataTempMax = known.length ? Math.max(...known) : null;
   const alignedBands = data.precipBands.map((series) => alignToLabels(series, labels));
   const precipMax = axisMax(alignedBands);
   // What the stacked bar at an index actually adds up to — the tooltip reports
@@ -300,13 +440,19 @@ export function buildMeteogramChartConfig({
   const precipTotals = labels.map((_, index) => (
     alignedBands.reduce((sum, series) => sum + (series[index] || 0), 0)
   ));
-  const tempRange = tempBounds(known, TEMP_AXIS_MIN_SPAN[mode] || TEMP_AXIS_MIN_SPAN.today);
+  const tempRange = suppliedTempRange
+    || tempBounds(known, TEMP_AXIS_MIN_SPAN[mode] || TEMP_AXIS_MIN_SPAN.today);
   const visibleBandTicks = bandTicks(bands, precipMax, localize);
   const bucketHours = mode === 'trend' ? (cardConfig.trend_bucket_hours || 3) : 1;
 
   const textColor = cssVar('--primary-text-color', '#212121');
   const secondaryColor = cssVar('--secondary-text-color', '#727272');
   const gridColor = cssVar('--divider-color', 'rgba(127,127,127,0.25)');
+  const cardBackgroundColor = cssVar('--card-background-color', '#ffffff');
+  const activePointColor = (index) => {
+    const temp = temperatures[index];
+    return temp != null ? colorAtTemp(temp, stops) : textColor;
+  };
 
   const datasets = [
     {
@@ -318,12 +464,12 @@ export function buildMeteogramChartConfig({
       borderWidth: compact ? 1.5 : 2.5,
       segment: {
         borderWidth: (ctx) => {
-          if (compact) {
-            return 1.5;
-          }
           const p0 = entries[ctx.p0DataIndex];
           const p1 = entries[ctx.p1DataIndex];
-          return (p0 && p1 && p0.measured && p1.measured) ? 1.5 : 2.5;
+          const bothMeasured = p0 && p1 && p0.measured && p1.measured;
+          return compact
+            ? (bothMeasured ? 1 : 1.5)
+            : (bothMeasured ? 1.5 : 2.5);
         },
       },
       tension: 0.35,
@@ -365,8 +511,13 @@ export function buildMeteogramChartConfig({
     data: { labels, datasets },
     plugins: [
       nowDividerPlugin(entries, localize, secondaryColor, !compact),
-      crosshairPlugin(() => (getActiveIndex ? getActiveIndex() : null), secondaryColor),
-      ...(activeDay != null ? [activeDayPlugin(entries, activeDay, gridColor)] : []),
+      crosshairPlugin(
+        () => (getActiveIndex ? getActiveIndex() : null),
+        secondaryColor,
+        activePointColor,
+        cardBackgroundColor,
+      ),
+      ...(activeDay != null ? [activeDayPlugin(entries, activeDay, textColor, cardBackgroundColor)] : []),
       ...(onLayout ? [layoutReportPlugin(onLayout)] : []),
     ],
     options: {
@@ -413,7 +564,10 @@ export function buildMeteogramChartConfig({
             },
           },
           border: { display: false },
-          ticks: compact ? { display: false } : {
+          // The day view moves its hour labels into the hour strip above the
+          // chart, so the axis itself carries no ticks there — only the trend
+          // view's weekday labels stay.
+          ticks: (compact || mode !== 'trend') ? { display: false } : {
             color: secondaryColor,
             maxRotation: 0,
             autoSkip: false,
@@ -438,7 +592,12 @@ export function buildMeteogramChartConfig({
             color: secondaryColor,
             font: { size: 11 },
             stepSize: TEMP_AXIS_STEP,
-            callback: (value) => `${Math.round(value)}°`,
+            callback: (value) => {
+              if (dataTempMax != null && (value > dataTempMax || value < dataTempMin)) {
+                return '';
+              }
+              return `${Math.round(value)}°`;
+            },
           },
         },
         precip: {
@@ -468,8 +627,23 @@ export function buildMeteogramChartConfig({
       plugins: {
         legend: { display: false },
         tooltip: {
-          enabled: compact ? false : mode === 'trend',
+          // Was trend-only because the day view had its own hover row above the
+          // chart; that row is going away, so the tooltip now carries the hourly
+          // read-out in both modes. Compact stays off — there is no room for it.
+          enabled: !compact,
           displayColors: false,
+          // Follows the temperature point instead of Chart.js's default
+          // 'average' positioner, which the stacked precipitation bars would
+          // otherwise drag toward the bottom of the chart (see the
+          // Tooltip.positioners.meteogramCurve registration above).
+          position: 'meteogramCurve',
+          // The animated glide toward a new position was the "always lags
+          // behind the mouse" delay reported by the user — the position
+          // itself is already instant via the custom positioner above; only
+          // the tween made it look delayed. Disabling both stops the box
+          // (and its fade) from easing between points.
+          animation: false,
+          animations: false,
           // `interaction.mode: 'index'` yields one item per dataset — one line plus
           // one per precipitation band. Everything the tooltip shows belongs to the
           // point in time, not to a single dataset, so only the first item survives
@@ -480,12 +654,18 @@ export function buildMeteogramChartConfig({
               if (!items.length) {
                 return '';
               }
-              const entry = entries[items[0].dataIndex];
-              return new Date(entry.datetime).toLocaleString(language, {
-                weekday: 'short',
-                hour: '2-digit',
-                minute: '2-digit',
-              });
+              const date = new Date(entries[items[0].dataIndex].datetime);
+              // Trend keeps the weekday since one point can be any of up to seven
+              // days; the day view already shows just one day, so the time alone
+              // is enough there.
+              if (mode === 'trend') {
+                return date.toLocaleString(language, {
+                  weekday: 'short',
+                  hour: '2-digit',
+                  minute: '2-digit',
+                });
+              }
+              return date.toLocaleTimeString(language, { hour: '2-digit', minute: '2-digit' });
             },
             label: (item) => {
               const entry = entries[item.dataIndex];
@@ -500,10 +680,14 @@ export function buildMeteogramChartConfig({
                 parts.push(`${localize('temperature')}: ${temp}°`);
               }
 
+              // Always shown, even at 0 — a dry hour is still worth confirming.
               const precip = precipTotals[item.dataIndex] || 0;
-              if (precip > 0) {
-                parts.push(`${localize('precipitation')}: ${precip.toFixed(1)} mm`);
-              }
+              parts.push(`${localize('precipitation')}: ${precip.toFixed(1)} mm`);
+
+              // Rain probability gets its own row above the chart instead — it is
+              // a forecast property of the whole hour, not a measured value like
+              // the two above, so it does not belong in this readout. Wind is not
+              // shown here either — it is not part of this card's readout.
 
               return parts;
             },
